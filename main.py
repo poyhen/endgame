@@ -11,6 +11,9 @@ api_id = os.getenv('API_ID')
 api_hash = os.getenv('API_HASH')
 bot_token = os.getenv('BOT_TOKEN')
 
+allowed_user_ids = list(map(int, os.getenv('ALLOWED_USER_IDS').split(',')))
+
+
 # Initialize the Pyrogram Client
 app = Client("bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 
@@ -77,7 +80,6 @@ async def download_and_upload(client, message, url):
         result = subprocess.run(['yt-dlp', '-o', output_template, url], capture_output=True, text=True)
 
         if result.returncode == 0:
-            await message.reply('Download completed successfully.')
 
             # Find the downloaded file
             downloaded_files = [f for f in os.listdir() if f.startswith(random_filename.split('.')[0])]
@@ -130,7 +132,6 @@ async def download_and_upload(client, message, url):
                 thumb=thumbnail_filename,
                 duration=video_duration
             )
-            await message.reply('Video uploaded successfully.')
 
             # Optionally, delete the files after uploading
             os.remove(downloaded_file)
@@ -140,16 +141,27 @@ async def download_and_upload(client, message, url):
     except Exception as e:
         await message.reply(f'An error occurred: {str(e)}')
 
+def check_user_access(user_id):
+    return user_id in allowed_user_ids
+
 @app.on_message(filters.command("start"))
 async def start(client, message):
     """Handle the /start command."""
-    await message.reply('Send a link to get the video.')
+    user_id = message.from_user.id
+    if check_user_access(user_id):
+        await message.reply('Send a link to get the video.')
+    else:
+        await message.reply('You are not allowed to use this application.')
 
 @app.on_message(filters.text & ~filters.command("start"))
 async def handle_message(client, message):
     """Handle incoming messages."""
+    user_id = message.from_user.id
+    if not check_user_access(user_id):
+        await message.reply('You are not allowed to use this application.')
+        return
+
     if url_pattern.search(message.text):
-        await message.reply('Downloading the video...')
         await download_and_upload(client, message, message.text)
     else:
         await message.reply('This is not a link.')
