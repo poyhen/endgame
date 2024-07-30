@@ -4,7 +4,6 @@ import subprocess
 import os
 import random
 import string
-import json
 
 # Fetch API credentials from environment variables
 api_id = os.getenv("API_ID")
@@ -152,7 +151,6 @@ async def download_and_upload(client, message, url):
         )
 
         if result.returncode == 0:
-
             # Find the downloaded file
             downloaded_files = [
                 f for f in os.listdir() if f.startswith(random_filename.split(".")[0])

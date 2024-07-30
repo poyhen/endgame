@@ -26,6 +26,7 @@
             curl-impersonate
             ffmpeg
             yt-dlp
+            ruff
           ];
         };
       }
