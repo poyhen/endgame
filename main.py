@@ -37,11 +37,11 @@ def extract_thumbnail(video_file):
         if extract_result.returncode != 0:
             raise Exception(f'Failed to extract thumbnail. Error: {extract_result.stderr}')
 
-        # Resize the thumbnail if needed
+        # Resize the thumbnail if needed, preserving the aspect ratio
         resize_result = subprocess.run(
-            ['ffmpeg', '-y', '-i', thumbnail_filename, '-vf', 'scale=320:240', thumbnail_filename],
+            ['ffmpeg', '-y', '-i', thumbnail_filename, '-vf', 'scale=w=320:h=240:force_original_aspect_ratio=decrease', thumbnail_filename],
             capture_output=True, text=True
-        )
+)
 
         if resize_result.returncode != 0:
             raise Exception(f'Failed to resize thumbnail. Error: {resize_result.stderr}')
