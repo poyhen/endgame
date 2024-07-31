@@ -396,7 +396,7 @@ async def handle_g_command(client, message):
         await message.reply("This is not a valid link.")
 
 
-@app.on_message(filters.text & ~filters.command(["start", "g"]))
+@app.on_message(filters.text & ~filters.command("start") & ~filters.command("g") & ~filters.command("h"))
 async def handle_message(client, message):
     """Handle incoming messages."""
     user_id = message.from_user.id
