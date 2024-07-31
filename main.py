@@ -410,5 +410,11 @@ async def handle_message(client, message):
         await message.reply("This is not a link.")
 
 
+@app.on_message(filters.command("h"))
+async def handle_h_command(client, message):
+    """Handle the /h command to check if the bot is alive."""
+    await message.reply("alive")
+
+
 print("Bot is running...")
 app.run()
