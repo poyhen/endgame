@@ -245,6 +245,122 @@ async def download_and_upload(client, message, url):
         await message.reply(f"An error occurred: {str(e)}")
 
 
+async def download_and_upload_1080p(client, message, url):
+    """Download the video from the URL in 1080p quality and upload it with a thumbnail."""
+    try:
+        # Generate a random filename for yt-dlp output
+        random_filename = generate_random_filename(".%(ext)s")
+        output_template = f"{random_filename}"
+        cookies_file = "cookies.txt"
+
+        # Run yt-dlp to download the video in 1080p
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "-o",
+                output_template,
+                "--cookies",
+                cookies_file,
+                "-f",
+                "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode == 0:
+            # Find the downloaded file
+            downloaded_files = [
+                f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
+            ]
+            if not downloaded_files:
+                await message.reply("Failed to find the downloaded file.")
+                return
+
+            downloaded_file = downloaded_files[0]
+
+            # Check if the URL is from YouTube
+            if "youtube.com" in url or "youtu.be" in url:
+                try:
+                    # Convert the video to MP4 using fast copy
+                    mp4_filename = generate_random_filename(".mp4")
+                    convert_result = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            downloaded_file,
+                            "-c",
+                            "copy",
+                            mp4_filename,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    if convert_result.returncode != 0:
+                        await message.reply(
+                            f"Failed to convert to MP4. Error: {convert_result.stderr}"
+                        )
+                        return
+
+                    # Replace the downloaded file with the MP4 file
+                    downloaded_file = mp4_filename
+
+                except Exception as e:
+                    await message.reply(
+                        f"An error occurred during conversion: {str(e)}"
+                    )
+                    return
+
+            # Extract the thumbnail
+            try:
+                thumbnail_filename = extract_thumbnail(downloaded_file)
+            except Exception as e:
+                await message.reply(
+                    f"An error occurred while extracting thumbnail: {str(e)}"
+                )
+                return
+
+            # Get video duration
+            try:
+                video_duration = get_video_duration(downloaded_file)
+            except Exception as e:
+                await message.reply(
+                    f"An error occurred while getting video duration: {str(e)}"
+                )
+                return
+
+            # Get video dimensions
+            try:
+                width, height = get_video_dimensions(downloaded_file)
+            except Exception as e:
+                await message.reply(
+                    f"An error occurred while getting video dimensions: {str(e)}"
+                )
+                return
+
+            # Upload the video file with thumbnail
+            await client.send_video(
+                message.chat.id,
+                downloaded_file,
+                supports_streaming=True,
+                thumb=thumbnail_filename,
+                duration=video_duration,
+                width=width,
+                height=height,
+            )
+
+            # Optionally, delete the files after uploading
+            os.remove(downloaded_file)
+            os.remove(thumbnail_filename)
+        else:
+            await message.reply(f"Failed to download the video. Error: {result.stderr}")
+    except Exception as e:
+        await message.reply(f"An error occurred: {str(e)}")
+
+
 def check_user_access(user_id):
     return user_id in allowed_user_ids
 
@@ -259,7 +375,28 @@ async def start(client, message):
         await message.reply("You are not allowed to use this application.")
 
 
-@app.on_message(filters.text & ~filters.command("start"))
+@app.on_message(filters.command("g"))
+async def handle_g_command(client, message):
+    """Handle the /g command to download videos in 1080p."""
+    user_id = message.from_user.id
+    if not check_user_access(user_id):
+        await message.reply("You are not allowed to use this application.")
+        return
+
+    # Extract the URL from the command
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) != 2:
+        await message.reply("Please provide a link after the /g command.")
+        return
+
+    url = command_parts[1]
+    if url_pattern.search(url):
+        await download_and_upload_1080p(client, message, url)
+    else:
+        await message.reply("This is not a valid link.")
+
+
+@app.on_message(filters.text & ~filters.command(["start", "g"]))
 async def handle_message(client, message):
     """Handle incoming messages."""
     user_id = message.from_user.id
