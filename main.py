@@ -384,7 +384,8 @@ async def handle_g_command(client, message):
     """Handle the /g command to download videos in 1080p."""
     user_id = message.from_user.id
     if not check_user_access(user_id):
-        await message.reply("you are not allowed to use this bot")
+        blocklist = "you are not allowed to use this bot. contact @" + bot_owner
+        await message.reply(blocklist)
         return
 
     # Extract the URL from the command
@@ -410,7 +411,8 @@ async def handle_message(client, message):
     """Handle incoming messages."""
     user_id = message.from_user.id
     if not check_user_access(user_id):
-        await message.reply("you are not allowed to use this bot")
+        blocklist = "you are not allowed to use this bot. contact @" + bot_owner
+        await message.reply(blocklist)
         return
 
     if url_pattern.search(message.text):
