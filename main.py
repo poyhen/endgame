@@ -9,6 +9,7 @@ import string
 api_id = os.getenv("API_ID")
 api_hash = os.getenv("API_HASH")
 bot_token = os.getenv("BOT_TOKEN")
+bot_owner = os.getenv("BOT_OWNER")
 
 allowed_user_ids = list(map(int, os.getenv("ALLOWED_USER_IDS").split(",")))
 
@@ -51,7 +52,7 @@ def extract_thumbnail(video_file):
 
         if extract_result.returncode != 0:
             raise Exception(
-                f"Failed to extract thumbnail. Error: {extract_result.stderr}"
+                f"failed to extract thumbnail. error: {extract_result.stderr}"
             )
 
         # Resize the thumbnail to a maximum width of 320 pixels while preserving the aspect ratio
@@ -71,7 +72,7 @@ def extract_thumbnail(video_file):
 
         if resize_result.returncode != 0:
             raise Exception(
-                f"Failed to resize thumbnail. Error: {resize_result.stderr}"
+                f"failed to resize thumbnail. error: {resize_result.stderr}"
             )
 
         return thumbnail_filename
@@ -99,7 +100,7 @@ def get_video_duration(video_file):
 
         if duration_result.returncode != 0:
             raise Exception(
-                f"Failed to get video duration. Error: {duration_result.stderr}"
+                f"failed to get video duration. error: {duration_result.stderr}"
             )
 
         duration = float(duration_result.stdout.strip())
@@ -129,7 +130,7 @@ def get_video_dimensions(video_file):
 
         if dimensions_result.returncode != 0:
             raise Exception(
-                f"Failed to get video dimensions. Error: {dimensions_result.stderr}"
+                f"failed to get video dimensions. error: {dimensions_result.stderr}"
             )
 
         width, height = map(int, dimensions_result.stdout.strip().split("x"))
@@ -159,7 +160,7 @@ async def download_and_upload(client, message, url):
                 f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
             ]
             if not downloaded_files:
-                await message.reply("Failed to find the downloaded file.")
+                await message.reply("failed to find the downloaded file")
                 return
 
             downloaded_file = downloaded_files[0]
@@ -185,7 +186,7 @@ async def download_and_upload(client, message, url):
 
                     if convert_result.returncode != 0:
                         await message.reply(
-                            f"Failed to convert to MP4. Error: {convert_result.stderr}"
+                            f"failed to convert to mp4. error: {convert_result.stderr}"
                         )
                         return
 
@@ -194,7 +195,7 @@ async def download_and_upload(client, message, url):
 
                 except Exception as e:
                     await message.reply(
-                        f"An error occurred during conversion: {str(e)}"
+                        f"an error occurred during conversion: {str(e)}"
                     )
                     return
 
@@ -203,7 +204,7 @@ async def download_and_upload(client, message, url):
                 thumbnail_filename = extract_thumbnail(downloaded_file)
             except Exception as e:
                 await message.reply(
-                    f"An error occurred while extracting thumbnail: {str(e)}"
+                    f"an error occurred while extracting thumbnail: {str(e)}"
                 )
                 return
 
@@ -212,7 +213,7 @@ async def download_and_upload(client, message, url):
                 video_duration = get_video_duration(downloaded_file)
             except Exception as e:
                 await message.reply(
-                    f"An error occurred while getting video duration: {str(e)}"
+                    f"an error occurred while getting video duration: {str(e)}"
                 )
                 return
 
@@ -221,7 +222,7 @@ async def download_and_upload(client, message, url):
                 width, height = get_video_dimensions(downloaded_file)
             except Exception as e:
                 await message.reply(
-                    f"An error occurred while getting video dimensions: {str(e)}"
+                    f"an error occurred while getting video dimensions: {str(e)}"
                 )
                 return
 
@@ -240,9 +241,9 @@ async def download_and_upload(client, message, url):
             os.remove(downloaded_file)
             os.remove(thumbnail_filename)
         else:
-            await message.reply(f"Failed to download the video. Error: {result.stderr}")
+            await message.reply(f"failed to download the video. error: {result.stderr}")
     except Exception as e:
-        await message.reply(f"An error occurred: {str(e)}")
+        await message.reply(f"an error occurred: {str(e)}")
 
 
 async def download_and_upload_1080p(client, message, url):
@@ -275,7 +276,7 @@ async def download_and_upload_1080p(client, message, url):
                 f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
             ]
             if not downloaded_files:
-                await message.reply("Failed to find the downloaded file.")
+                await message.reply("failed to find the downloaded file")
                 return
 
             downloaded_file = downloaded_files[0]
@@ -301,7 +302,7 @@ async def download_and_upload_1080p(client, message, url):
 
                     if convert_result.returncode != 0:
                         await message.reply(
-                            f"Failed to convert to MP4. Error: {convert_result.stderr}"
+                            f"failed to convert to mp4. error: {convert_result.stderr}"
                         )
                         return
 
@@ -310,7 +311,7 @@ async def download_and_upload_1080p(client, message, url):
 
                 except Exception as e:
                     await message.reply(
-                        f"An error occurred during conversion: {str(e)}"
+                        f"an error occurred during conversion: {str(e)}"
                     )
                     return
 
@@ -319,7 +320,7 @@ async def download_and_upload_1080p(client, message, url):
                 thumbnail_filename = extract_thumbnail(downloaded_file)
             except Exception as e:
                 await message.reply(
-                    f"An error occurred while extracting thumbnail: {str(e)}"
+                    f"an error occurred while extracting thumbnail: {str(e)}"
                 )
                 return
 
@@ -328,7 +329,7 @@ async def download_and_upload_1080p(client, message, url):
                 video_duration = get_video_duration(downloaded_file)
             except Exception as e:
                 await message.reply(
-                    f"An error occurred while getting video duration: {str(e)}"
+                    f"an error occurred while getting video duration: {str(e)}"
                 )
                 return
 
@@ -337,7 +338,7 @@ async def download_and_upload_1080p(client, message, url):
                 width, height = get_video_dimensions(downloaded_file)
             except Exception as e:
                 await message.reply(
-                    f"An error occurred while getting video dimensions: {str(e)}"
+                    f"an error occurred while getting video dimensions: {str(e)}"
                 )
                 return
 
@@ -356,9 +357,9 @@ async def download_and_upload_1080p(client, message, url):
             os.remove(downloaded_file)
             os.remove(thumbnail_filename)
         else:
-            await message.reply(f"Failed to download the video. Error: {result.stderr}")
+            await message.reply(f"failed to download the video. error: {result.stderr}")
     except Exception as e:
-        await message.reply(f"An error occurred: {str(e)}")
+        await message.reply(f"an error occurred: {str(e)}")
 
 
 def check_user_access(user_id):
@@ -370,9 +371,12 @@ async def start(client, message):
     """Handle the /start command."""
     user_id = message.from_user.id
     if check_user_access(user_id):
-        await message.reply("Send a link to get the video.")
+        await message.reply(
+            "send a link. sometimes cookies can expire (eg. instagram) it can take a while for me to refresh them, please be patient. also this bot is in alpha stage, don't expect it to be flawless"
+        )
     else:
-        await message.reply("You are not allowed to use this application.")
+        blacklist = "your user id needs to be whitelisted. please contact @" + bot_owner
+        await message.reply(blacklist)
 
 
 @app.on_message(filters.command("g"))
@@ -380,34 +384,39 @@ async def handle_g_command(client, message):
     """Handle the /g command to download videos in 1080p."""
     user_id = message.from_user.id
     if not check_user_access(user_id):
-        await message.reply("You are not allowed to use this application.")
+        await message.reply("you are not allowed to use this bot")
         return
 
     # Extract the URL from the command
     command_parts = message.text.split(maxsplit=1)
     if len(command_parts) != 2:
-        await message.reply("Please provide a link after the /g command.")
+        await message.reply("please provide a link after the /g command")
         return
 
     url = command_parts[1]
     if url_pattern.search(url):
         await download_and_upload_1080p(client, message, url)
     else:
-        await message.reply("This is not a valid link.")
+        await message.reply("this is not a valid link")
 
 
-@app.on_message(filters.text & ~filters.command("start") & ~filters.command("g") & ~filters.command("h"))
+@app.on_message(
+    filters.text
+    & ~filters.command("start")
+    & ~filters.command("g")
+    & ~filters.command("h")
+)
 async def handle_message(client, message):
     """Handle incoming messages."""
     user_id = message.from_user.id
     if not check_user_access(user_id):
-        await message.reply("You are not allowed to use this application.")
+        await message.reply("you are not allowed to use this bot")
         return
 
     if url_pattern.search(message.text):
         await download_and_upload(client, message, message.text)
     else:
-        await message.reply("This is not a link.")
+        await message.reply("this is not a link")
 
 
 @app.on_message(filters.command("h"))
