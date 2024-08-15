@@ -25,7 +25,9 @@ url_pattern = re.compile(
 def generate_random_filename(extension=""):
     """Generate a random filename with a given extension."""
     return (
-        "".join(random.choices(string.ascii_letters + string.digits, k=10)) + extension
+        "".join(random.choices(string.ascii_letters + string.digits, k=10))
+        + "frrr"
+        + extension
     )
 
 
@@ -401,6 +403,142 @@ async def handle_g_command(client, message):
         await message.reply("this is not a valid link")
 
 
+async def download_and_upload_instagram(client, message, url):
+    """Download Instagram video and ensure it's in AVC1 format for Telegram."""
+    try:
+        # Generate a random filename for yt-dlp output
+        random_filename = generate_random_filename(".%(ext)s")
+        output_template = f"{random_filename}"
+        cookies_file = "cookies.txt"
+
+        # First, try to download the video in AVC1 format using yt-dlp
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "-o",
+                output_template,
+                "--cookies",
+                cookies_file,
+                "-f",
+                "bestvideo[vcodec^=avc1]+bestaudio/best[vcodec^=avc1]",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode == 0:
+            # Find the downloaded file
+            downloaded_files = [
+                f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
+            ]
+            if not downloaded_files:
+                await message.reply("Failed to find the downloaded file")
+                return
+
+            downloaded_file = downloaded_files[0]
+        else:
+            # If yt-dlp fails to download in AVC1, download in any format and convert
+            fallback_result = subprocess.run(
+                ["yt-dlp", "-o", output_template, "--cookies", cookies_file, url],
+                capture_output=True,
+                text=True,
+            )
+
+            if fallback_result.returncode != 0:
+                await message.reply(
+                    f"Failed to download the video. Error: {fallback_result.stderr}"
+                )
+                return
+
+            downloaded_files = [
+                f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
+            ]
+            if not downloaded_files:
+                await message.reply("Failed to find the downloaded file")
+                return
+
+            downloaded_file = downloaded_files[0]
+
+            # Convert VP9 to AVC1 using ffmpeg with fast copy
+            avc1_filename = generate_random_filename(".mp4")
+            convert_result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    downloaded_file,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    avc1_filename,
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            if convert_result.returncode != 0:
+                await message.reply(
+                    f"Failed to convert video to AVC1. Error: {convert_result.stderr}"
+                )
+                return
+
+            # Remove the original downloaded file and use the converted file
+            os.remove(downloaded_file)
+            downloaded_file = avc1_filename
+
+        # Extract the thumbnail
+        try:
+            thumbnail_filename = extract_thumbnail(downloaded_file)
+        except Exception as e:
+            await message.reply(
+                f"An error occurred while extracting thumbnail: {str(e)}"
+            )
+            return
+
+        # Get video duration
+        try:
+            video_duration = get_video_duration(downloaded_file)
+        except Exception as e:
+            await message.reply(
+                f"An error occurred while getting video duration: {str(e)}"
+            )
+            return
+
+        # Get video dimensions
+        try:
+            width, height = get_video_dimensions(downloaded_file)
+        except Exception as e:
+            await message.reply(
+                f"An error occurred while getting video dimensions: {str(e)}"
+            )
+            return
+
+        # Upload the video file with thumbnail
+        await client.send_video(
+            message.chat.id,
+            downloaded_file,
+            supports_streaming=True,
+            thumb=thumbnail_filename,
+            duration=video_duration,
+            width=width,
+            height=height,
+        )
+
+        # Delete the files after uploading
+        os.remove(downloaded_file)
+        os.remove(thumbnail_filename)
+
+    except Exception as e:
+        await message.reply(f"An error occurred: {str(e)}")
+
+
 @app.on_message(
     filters.text
     & ~filters.command("start")
@@ -411,14 +549,18 @@ async def handle_message(client, message):
     """Handle incoming messages."""
     user_id = message.from_user.id
     if not check_user_access(user_id):
-        blocklist = "you are not allowed to use this bot. contact @" + bot_owner
+        blocklist = "You are not allowed to use this bot. Contact @" + bot_owner
         await message.reply(blocklist)
         return
 
     if url_pattern.search(message.text):
-        await download_and_upload(client, message, message.text)
+        url = message.text
+        if "instagram.com" in url:
+            await download_and_upload_instagram(client, message, url)
+        else:
+            await download_and_upload(client, message, url)
     else:
-        await message.reply("this is not a link")
+        await message.reply("This is not a link")
 
 
 @app.on_message(filters.command("h"))
