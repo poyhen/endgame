@@ -148,10 +148,22 @@ async def download_and_upload(client, message, url):
         random_filename = generate_random_filename(".%(ext)s")
         output_template = f"{random_filename}"
         cookies_file = "cookies.txt"
+        user_agent = (
+            "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"
+        )
 
         # Run yt-dlp to download the video
         result = subprocess.run(
-            ["yt-dlp", "-o", output_template, "--cookies", cookies_file, url],
+            [
+                "yt-dlp",
+                "-o",
+                output_template,
+                "--cookies",
+                cookies_file,
+                "--user-agent",
+                user_agent,
+                url,
+            ],
             capture_output=True,
             text=True,
         )
