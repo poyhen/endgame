@@ -1,17 +1,35 @@
-from pyrogram import Client, filters
-import re
-import subprocess
 import os
 import random
+import re
 import string
+import subprocess
+
+from pyrogram import filters
+from pyrogram.client import Client
 
 # Fetch API credentials from environment variables
 api_id = os.getenv("API_ID")
-api_hash = os.getenv("API_HASH")
-bot_token = os.getenv("BOT_TOKEN")
-bot_owner = os.getenv("BOT_OWNER")
+if api_id is None:
+    raise ValueError("API_ID environment variable is not set")
+api_id = int(api_id)
 
-allowed_user_ids = list(map(int, os.getenv("ALLOWED_USER_IDS").split(",")))
+api_hash = os.getenv("API_HASH")
+if api_hash is None:
+    raise ValueError("API_HASH environment variable is not set")
+
+bot_token = os.getenv("BOT_TOKEN")
+if bot_token is None:
+    raise ValueError("BOT_TOKEN environment variable is not set")
+
+bot_owner = os.getenv("BOT_OWNER")
+if bot_owner is None:
+    raise ValueError("BOT_OWNER environment variable is not set")
+
+allowed_user_ids = (
+    list(map(int, (os.getenv("ALLOWED_USER_IDS") or "").split(",")))
+    if os.getenv("ALLOWED_USER_IDS")
+    else []
+)
 
 # Initialize the Pyrogram Client
 app = Client("bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
@@ -389,7 +407,12 @@ async def start(client, message):
             "send a link. sometimes cookies can expire (eg. instagram) it can take a while for me to refresh them, please be patient. also this bot is in alpha stage, don't expect it to be flawless"
         )
     else:
-        blacklist = "your user id needs to be whitelisted. please contact @" + bot_owner
+        if bot_owner is None:
+            blacklist = "your user id needs to be whitelisted. please contact an admin"
+        else:
+            blacklist = (
+                f"your user id needs to be whitelisted. please contact @{bot_owner}"
+            )
         await message.reply(blacklist)
 
 
@@ -398,7 +421,10 @@ async def handle_g_command(client, message):
     """Handle the /g command to download videos in 1080p."""
     user_id = message.from_user.id
     if not check_user_access(user_id):
-        blocklist = "you are not allowed to use this bot. contact @" + bot_owner
+        if bot_owner is None:
+            blocklist = "you are not allowed to use this bot. contact an admin"
+        else:
+            blocklist = f"you are not allowed to use this bot. contact @{bot_owner}"
         await message.reply(blocklist)
         return
 
@@ -425,7 +451,10 @@ async def handle_message(client, message):
     """Handle incoming messages."""
     user_id = message.from_user.id
     if not check_user_access(user_id):
-        blocklist = "you are not allowed to use this bot. contact @" + bot_owner
+        if bot_owner is None:
+            blocklist = "you are not allowed to use this bot. contact an admin"
+        else:
+            blocklist = f"you are not allowed to use this bot. contact @{bot_owner}"
         await message.reply(blocklist)
         return
 

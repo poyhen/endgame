@@ -1,3 +1,4 @@
 .envrc
 bot.session
 cookies.txt
+.direnv
