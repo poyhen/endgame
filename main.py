@@ -162,236 +162,242 @@ def get_video_dimensions(video_file):
 async def download_and_upload(client, message, url):
     """Download the video from the URL and upload it with a thumbnail."""
     try:
-        # Generate a random filename for yt-dlp output
-        random_filename = generate_random_filename(".%(ext)s")
-        output_template = f"{random_filename}"
-        cookies_file = "cookies.txt"
-        user_agent = (
-            "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"
-        )
+        await download_video(client, message, url)
+    except Exception as e:
+        await message.reply(f"an error occurred: {str(e)}")
 
-        # Run yt-dlp to download the video
-        result = subprocess.run(
+
+async def download_video(client, message, url):
+    """Download video using yt-dlp and process it."""
+    # Generate a random filename for yt-dlp output
+    random_filename = generate_random_filename(".%(ext)s")
+    output_template = f"{random_filename}"
+    cookies_file = "cookies.txt"
+    user_agent = (
+        "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"
+    )
+
+    # Run yt-dlp to download the video
+    result = await run_ytdlp(output_template, cookies_file, user_agent, url)
+
+    if result.returncode == 0:
+        downloaded_file = await process_download(message, random_filename)
+        if downloaded_file:
+            await process_video(client, message, downloaded_file, url)
+
+
+async def run_ytdlp(output_template, cookies_file, user_agent, url):
+    """Run yt-dlp command to download video."""
+    return subprocess.run(
+        [
+            "yt-dlp",
+            "-o",
+            output_template,
+            "--cookies",
+            cookies_file,
+            "--user-agent",
+            user_agent,
+            url,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+async def process_download(message, random_filename):
+    """Find and verify downloaded file."""
+    downloaded_files = [
+        f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
+    ]
+    if not downloaded_files:
+        await message.reply("failed to find the downloaded file")
+        return None
+    return downloaded_files[0]
+
+
+async def process_video(client, message, downloaded_file, url):
+    """Process video file and upload to chat."""
+    if "youtube.com" in url or "youtu.be" in url:
+        downloaded_file = await convert_to_mp4(message, downloaded_file)
+        if not downloaded_file:
+            return
+
+    # Get video metadata
+    try:
+        thumbnail_filename = extract_thumbnail(downloaded_file)
+        video_duration = get_video_duration(downloaded_file)
+        width, height = get_video_dimensions(downloaded_file)
+    except Exception as e:
+        await message.reply(f"Error processing video metadata: {str(e)}")
+        return
+
+    # Upload and cleanup
+    await client.send_video(
+        message.chat.id,
+        downloaded_file,
+        supports_streaming=True,
+        thumb=thumbnail_filename,
+        duration=video_duration,
+        width=width,
+        height=height,
+    )
+
+    os.remove(downloaded_file)
+    os.remove(thumbnail_filename)
+
+
+async def convert_to_mp4(message, downloaded_file):
+    """Convert video to MP4 format."""
+    try:
+        mp4_filename = generate_random_filename(".mp4")
+        convert_result = subprocess.run(
             [
-                "yt-dlp",
-                "-o",
-                output_template,
-                "--cookies",
-                cookies_file,
-                "--user-agent",
-                user_agent,
-                url,
+                "ffmpeg",
+                "-y",
+                "-i",
+                downloaded_file,
+                "-c",
+                "copy",
+                mp4_filename,
             ],
             capture_output=True,
             text=True,
         )
 
-        if result.returncode == 0:
-            # Find the downloaded file
-            downloaded_files = [
-                f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
-            ]
-            if not downloaded_files:
-                await message.reply("failed to find the downloaded file")
-                return
-
-            downloaded_file = downloaded_files[0]
-
-            # Check if the URL is from YouTube
-            if "youtube.com" in url or "youtu.be" in url:
-                try:
-                    # Convert the video to MP4 using fast copy
-                    mp4_filename = generate_random_filename(".mp4")
-                    convert_result = subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            downloaded_file,
-                            "-c",
-                            "copy",
-                            mp4_filename,
-                        ],
-                        capture_output=True,
-                        text=True,
-                    )
-
-                    if convert_result.returncode != 0:
-                        await message.reply(
-                            f"failed to convert to mp4. error: {convert_result.stderr}"
-                        )
-                        return
-
-                    # Replace the downloaded file with the MP4 file
-                    downloaded_file = mp4_filename
-
-                except Exception as e:
-                    await message.reply(
-                        f"an error occurred during conversion: {str(e)}"
-                    )
-                    return
-
-            # Extract the thumbnail
-            try:
-                thumbnail_filename = extract_thumbnail(downloaded_file)
-            except Exception as e:
-                await message.reply(
-                    f"an error occurred while extracting thumbnail: {str(e)}"
-                )
-                return
-
-            # Get video duration
-            try:
-                video_duration = get_video_duration(downloaded_file)
-            except Exception as e:
-                await message.reply(
-                    f"an error occurred while getting video duration: {str(e)}"
-                )
-                return
-
-            # Get video dimensions
-            try:
-                width, height = get_video_dimensions(downloaded_file)
-            except Exception as e:
-                await message.reply(
-                    f"an error occurred while getting video dimensions: {str(e)}"
-                )
-                return
-
-            # Upload the video file with thumbnail
-            await client.send_video(
-                message.chat.id,
-                downloaded_file,
-                supports_streaming=True,
-                thumb=thumbnail_filename,
-                duration=video_duration,
-                width=width,
-                height=height,
+        if convert_result.returncode != 0:
+            await message.reply(
+                f"failed to convert to mp4. error: {convert_result.stderr}"
             )
+            return None
 
-            # Optionally, delete the files after uploading
-            os.remove(downloaded_file)
-            os.remove(thumbnail_filename)
-        else:
-            await message.reply(f"failed to download the video. error: {result.stderr}")
+        return mp4_filename
+
     except Exception as e:
-        await message.reply(f"an error occurred: {str(e)}")
+        await message.reply(f"an error occurred during conversion: {str(e)}")
+        return None
 
 
 async def download_and_upload_1080p(client, message, url):
     """Download the video from the URL in 1080p quality and upload it with a thumbnail."""
     try:
-        # Generate a random filename for yt-dlp output
-        random_filename = generate_random_filename(".%(ext)s")
-        output_template = f"{random_filename}"
-        cookies_file = "cookies.txt"
+        downloaded_file = await download_video_1080p(client, message, url)
+        if not downloaded_file:
+            return
 
-        # Run yt-dlp to download the video in 1080p
-        result = subprocess.run(
+        if "youtube.com" in url or "youtu.be" in url:
+            downloaded_file = await convert_to_mp4_1080p(message, downloaded_file)
+            if not downloaded_file:
+                return
+
+        video_data = await get_video_metadata_1080p(message, downloaded_file)
+        if not video_data:
+            return
+
+        await upload_video_1080p(client, message, downloaded_file, video_data)
+
+    except Exception as e:
+        await message.reply(f"an error occurred: {str(e)}")
+
+
+async def download_video_1080p(client, message, url):
+    random_filename = generate_random_filename(".%(ext)s")
+    output_template = f"{random_filename}"
+    cookies_file = "cookies.txt"
+
+    result = subprocess.run(
+        [
+            "yt-dlp",
+            "-o",
+            output_template,
+            "--cookies",
+            cookies_file,
+            "-f",
+            "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        await message.reply(f"failed to download the video. error: {result.stderr}")
+        return None
+
+    downloaded_files = [
+        f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
+    ]
+    if not downloaded_files:
+        await message.reply("failed to find the downloaded file")
+        return None
+
+    return downloaded_files[0]
+
+
+async def convert_to_mp4_1080p(message, downloaded_file):
+    try:
+        mp4_filename = generate_random_filename(".mp4")
+        convert_result = subprocess.run(
             [
-                "yt-dlp",
-                "-o",
-                output_template,
-                "--cookies",
-                cookies_file,
-                "-f",
-                "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-                url,
+                "ffmpeg",
+                "-y",
+                "-i",
+                downloaded_file,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
+                "-c:a",
+                "copy",
+                mp4_filename,
             ],
             capture_output=True,
             text=True,
         )
 
-        if result.returncode == 0:
-            # Find the downloaded file
-            downloaded_files = [
-                f for f in os.listdir() if f.startswith(random_filename.split(".")[0])
-            ]
-            if not downloaded_files:
-                await message.reply("failed to find the downloaded file")
-                return
-
-            downloaded_file = downloaded_files[0]
-
-            # Check if the URL is from YouTube
-            if "youtube.com" in url or "youtu.be" in url:
-                try:
-                    # Convert the video to MP4 using fast copy
-                    mp4_filename = generate_random_filename(".mp4")
-                    convert_result = subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            downloaded_file,
-                            "-c",
-                            "copy",
-                            mp4_filename,
-                        ],
-                        capture_output=True,
-                        text=True,
-                    )
-
-                    if convert_result.returncode != 0:
-                        await message.reply(
-                            f"failed to convert to mp4. error: {convert_result.stderr}"
-                        )
-                        return
-
-                    # Replace the downloaded file with the MP4 file
-                    downloaded_file = mp4_filename
-
-                except Exception as e:
-                    await message.reply(
-                        f"an error occurred during conversion: {str(e)}"
-                    )
-                    return
-
-            # Extract the thumbnail
-            try:
-                thumbnail_filename = extract_thumbnail(downloaded_file)
-            except Exception as e:
-                await message.reply(
-                    f"an error occurred while extracting thumbnail: {str(e)}"
-                )
-                return
-
-            # Get video duration
-            try:
-                video_duration = get_video_duration(downloaded_file)
-            except Exception as e:
-                await message.reply(
-                    f"an error occurred while getting video duration: {str(e)}"
-                )
-                return
-
-            # Get video dimensions
-            try:
-                width, height = get_video_dimensions(downloaded_file)
-            except Exception as e:
-                await message.reply(
-                    f"an error occurred while getting video dimensions: {str(e)}"
-                )
-                return
-
-            # Upload the video file with thumbnail
-            await client.send_video(
-                message.chat.id,
-                downloaded_file,
-                supports_streaming=True,
-                thumb=thumbnail_filename,
-                duration=video_duration,
-                width=width,
-                height=height,
+        if convert_result.returncode != 0:
+            await message.reply(
+                f"failed to convert to mp4. error: {convert_result.stderr}"
             )
+            return None
 
-            # Optionally, delete the files after uploading
-            os.remove(downloaded_file)
-            os.remove(thumbnail_filename)
-        else:
-            await message.reply(f"failed to download the video. error: {result.stderr}")
+        return mp4_filename
+
     except Exception as e:
-        await message.reply(f"an error occurred: {str(e)}")
+        await message.reply(f"an error occurred during conversion: {str(e)}")
+        return None
+
+
+async def get_video_metadata_1080p(message, downloaded_file):
+    try:
+        thumbnail_filename = extract_thumbnail(downloaded_file)
+        video_duration = get_video_duration(downloaded_file)
+        width, height = get_video_dimensions(downloaded_file)
+        return {
+            "thumbnail": thumbnail_filename,
+            "duration": video_duration,
+            "width": width,
+            "height": height,
+        }
+    except Exception as e:
+        await message.reply(f"Error processing video metadata: {str(e)}")
+        return None
+
+
+async def upload_video_1080p(client, message, downloaded_file, video_data):
+    await client.send_video(
+        message.chat.id,
+        downloaded_file,
+        supports_streaming=True,
+        thumb=video_data["thumbnail"],
+        duration=video_data["duration"],
+        width=video_data["width"],
+        height=video_data["height"],
+    )
+
+    os.remove(downloaded_file)
+    os.remove(video_data["thumbnail"])
 
 
 def check_user_access(user_id):
