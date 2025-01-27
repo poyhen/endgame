@@ -2,3 +2,8 @@
 bot.session
 cookies.txt
 .direnv
+.ropeproject
+.ruff_cache
+bot.session-journal
+__pycache__
+.vscode
