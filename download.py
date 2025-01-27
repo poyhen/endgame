@@ -29,7 +29,7 @@ async def download_and_upload(client, message, url):
                 "--user-agent",
                 user_agent,
                 "-f",
-                "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",  # Prefer H.264 videos
+                "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                 url,
             ],
             capture_output=True,

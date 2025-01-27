@@ -4,7 +4,19 @@ from download import download_and_upload
 from utils import check_user_access
 from pyrogram import filters
 
-app = Client("bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
+if not api_id or not isinstance(api_id, (int, str)):
+    raise ValueError("API ID must be a non-empty integer or string")
+if not api_hash or not isinstance(api_hash, str):
+    raise ValueError("API Hash must be a non-empty string")
+if not bot_token or not isinstance(bot_token, str):
+    raise ValueError("Bot Token must be a non-empty string")
+
+app = Client(
+    "bot",
+    api_id=int(api_id) if isinstance(api_id, str) else api_id,
+    api_hash=str(api_hash),
+    bot_token=str(bot_token),
+)
 
 
 @app.on_message(filters.command("start"))
