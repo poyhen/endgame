@@ -49,6 +49,7 @@ async def download_and_upload(client, message, url):
             if "youtube.com" in url or "youtu.be" in url:
                 try:
                     mp4_filename = generate_random_filename(".mp4")
+                    original_file = downloaded_file
                     convert_result = subprocess.run(
                         [
                             "ffmpeg",
@@ -70,6 +71,7 @@ async def download_and_upload(client, message, url):
                         return
 
                     downloaded_file = mp4_filename
+                    os.remove(original_file)
 
                 except Exception as e:
                     await message.reply(
@@ -111,9 +113,15 @@ async def download_and_upload(client, message, url):
                 height=height,
             )
 
-            os.remove(downloaded_file)
-            os.remove(thumbnail_filename)
+            if os.path.exists(downloaded_file):
+                os.remove(downloaded_file)
+            if os.path.exists(thumbnail_filename):
+                os.remove(thumbnail_filename)
         else:
             await message.reply(f"failed to download the video. error: {result.stderr}")
     except Exception as e:
         await message.reply(f"an error occurred: {str(e)}")
+        if "downloaded_file" in locals() and os.path.exists(downloaded_file):
+            os.remove(downloaded_file)
+        if "thumbnail_filename" in locals() and os.path.exists(thumbnail_filename):
+            os.remove(thumbnail_filename)

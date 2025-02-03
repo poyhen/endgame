@@ -7,3 +7,6 @@ cookies.txt
 bot.session-journal
 __pycache__
 .vscode
+*.mp4
+*.webm
+*.mkv
