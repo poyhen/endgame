@@ -12,6 +12,21 @@ from utils import (
 async def download_and_upload(client, message, url):
     """Download the video from the URL and upload it with a thumbnail."""
     try:
+        PLATFORM_CONFIG = {
+            "tiktok.com": {
+                "format": 'bestvideo[ext=mp4][vcodec=h264]+bestaudio[ext=m4a]/best[ext=mp4][vcodec=h264]/best'
+            },
+        }
+
+        format_selector = None
+        for domain, config in PLATFORM_CONFIG.items():
+            if domain in url:
+                format_selector = config["format"]
+                break
+
+        if format_selector is None:
+            format_selector = "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+
         random_filename = generate_random_filename(".%(ext)s")
         output_template = f"{random_filename}"
         cookies_file = "cookies.txt"
@@ -29,7 +44,7 @@ async def download_and_upload(client, message, url):
                 "--user-agent",
                 user_agent,
                 "-f",
-                "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                format_selector,
                 url,
             ],
             capture_output=True,
