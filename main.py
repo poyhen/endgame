@@ -29,11 +29,9 @@ async def start(client, message):
         )
     else:
         if bot_owner is None:
-            blacklist = "your user id needs to be whitelisted. please contact an admin"
+            blacklist = ""
         else:
-            blacklist = (
-                f"your user id needs to be whitelisted. please contact @{bot_owner}"
-            )
+            blacklist = ""
         await message.reply(blacklist)
 
 
@@ -43,9 +41,9 @@ async def handle_message(client, message):
     user_id = message.from_user.id
     if not check_user_access(user_id):
         if bot_owner is None:
-            blocklist = "you are not allowed to use this bot. contact an admin"
+            blocklist = ""
         else:
-            blocklist = f"you are not allowed to use this bot. contact @{bot_owner}"
+            blocklist = ""
         await message.reply(blocklist)
         return
 
