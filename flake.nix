@@ -8,9 +8,9 @@
 
   outputs =
     {
-      self,
       nixpkgs,
       flake-utils,
+      ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -30,6 +30,7 @@
             curl-impersonate-chrome
             ffmpeg
             yt-dlp
+            gallery-dl
             ruff
           ];
         };
