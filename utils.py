@@ -115,10 +115,10 @@ async def get_video_duration(video_file):
     except Exception as e:
         raise e
 
-
 async def get_video_dimensions(video_file):
-    """Get the width and height of the video."""
+    """Get the width and height of the video using the new ffprobe command."""
     try:
+        # Updated ffprobe command to output width and height on separate lines
         ffprobe_command = [
             "ffprobe",
             "-v",
@@ -128,11 +128,11 @@ async def get_video_dimensions(video_file):
             "-show_entries",
             "stream=width,height",
             "-of",
-            "csv=s=x:p=0",
+            "default=noprint_wrappers=1:nokey=1",
             video_file,
         ]
         process_dimensions = await asyncio.create_subprocess_exec(
-            *ffprobe_command,  # Unpack the list
+            *ffprobe_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -143,16 +143,23 @@ async def get_video_dimensions(video_file):
             "stderr": stderr_dimensions.decode("utf-8") if stderr_dimensions else "",
         }
 
-        if (
-            dimensions_result.get("returncode") != 0
-        ):  # Use dict get method for safe access
+        # Check if ffprobe executed successfully
+        if dimensions_result.get("returncode") != 0:
             raise Exception(
-                f"failed to get video dimensions. error: {dimensions_result.get('stderr', '')}"  # Use dict get method for safe access
+                f"failed to get video dimensions. error: {dimensions_result.get('stderr', '')}"
             )
 
-        width, height = map(
-            int, dimensions_result.get("stdout", "").strip().split("x")
-        )  # Use dict get method for safe access
+        # Parse the output: expect exactly two lines (width and height)
+        output = dimensions_result.get("stdout", "").strip()
+        lines = output.splitlines()
+        if len(lines) != 2:
+            raise Exception(f"expected two lines for width and height, got {len(lines)} lines")
+        try:
+            width = int(lines[0])
+            height = int(lines[1])
+        except ValueError:
+            raise Exception(f"unable to parse dimensions from output: {output}")
+
         return width, height
     except Exception as e:
         raise e
