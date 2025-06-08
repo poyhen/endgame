@@ -28,8 +28,6 @@
             python312Packages.curl-cffi
             python312Packages.cffi
             curl-impersonate-chrome
-            curl-impersonate-ff
-            curl-impersonate
             ffmpeg
             yt-dlp
             ruff

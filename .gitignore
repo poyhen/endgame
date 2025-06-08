@@ -11,3 +11,5 @@ __pycache__
 *.webm
 *.mkv
 *.jpg
+.DS_Store
+.glimpse
