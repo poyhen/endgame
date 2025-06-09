@@ -28,7 +28,6 @@ async def download_and_upload(client, message, url):
     # For yt-dlp, it will be a direct file path. For gallery-dl, a directory.
     path_to_clean = None
     is_yt_dlp_download = False  # Flag to know if path_to_clean is a file or dir
-    thumbnail_filename = None
 
     # Determine which tool to use
     # Prioritize yt-dlp for known video sources that benefit from its specific handling
@@ -160,74 +159,120 @@ async def download_and_upload(client, message, url):
                 )
                 return
 
-            processed_successfully = False
-            # Process the first valid media item found
-            # For yt-dlp, there should only be one. For gallery-dl, we take the best match.
-            item_path_to_process = downloaded_media_paths[0]
+            any_item_processed_successfully = False
+            items_sent_count = 0
 
-            # Ensure the file exists before processing
-            if not os.path.exists(item_path_to_process):
-                await message.reply(
-                    f"Downloaded file {item_path_to_process} seems to have disappeared before processing."
-                )
-                return
+            for item_path_to_process in downloaded_media_paths:
+                # Ensure the file exists before processing
+                if not os.path.exists(item_path_to_process):
+                    if not use_yt_dlp:  # gallery-dl
+                        await message.reply(
+                            f"Skipping a downloaded file ({os.path.basename(item_path_to_process)}) as it seems to have disappeared before processing."
+                        )
+                        continue
+                    else:  # yt-dlp: single file, if it's gone, it's a failure for this op
+                        await message.reply(
+                            f"Downloaded file {item_path_to_process} seems to have disappeared before processing."
+                        )
+                        return  # Exits download_and_upload, finally will run
 
-            mime_type, _ = mimetypes.guess_type(item_path_to_process)
-            is_video = mime_type and mime_type.startswith("video")
-            is_image = mime_type and mime_type.startswith("image")
+                mime_type, _ = mimetypes.guess_type(item_path_to_process)
+                is_video = mime_type and mime_type.startswith("video")
+                is_image = mime_type and mime_type.startswith("image")
 
-            if is_video:
-                try:
-                    # yt-dlp with H.264 format selector should produce compatible mp4.
-                    # If ffmpeg conversion is ever needed again for yt-dlp outputs:
-                    # if use_yt_dlp and not item_path_to_process.lower().endswith(".mp4"):
-                    #     # ... (ffmpeg conversion logic, update item_path_to_process and path_to_clean if original is removed)
+                current_item_processed_this_iteration = False
+                local_thumbnail_filename = None  # For per-video thumbnail
 
-                    thumbnail_filename = await extract_thumbnail(item_path_to_process)
-                    video_duration = await get_video_duration(item_path_to_process)
-                    width, height = await get_video_dimensions(item_path_to_process)
+                if is_video:
+                    try:
+                        local_thumbnail_filename = await extract_thumbnail(
+                            item_path_to_process
+                        )
+                        video_duration = await get_video_duration(item_path_to_process)
+                        width, height = await get_video_dimensions(item_path_to_process)
 
-                    await client.send_video(
-                        message.chat.id,
-                        item_path_to_process,
-                        supports_streaming=True,
-                        thumb=thumbnail_filename,
-                        duration=video_duration,
-                        width=width,
-                        height=height,
-                    )
-                    processed_successfully = True
-                except Exception as e:
-                    await message.reply(
-                        f"Error processing video {os.path.basename(item_path_to_process)}: {str(e)}"
-                    )
+                        await client.send_video(
+                            message.chat.id,
+                            item_path_to_process,
+                            supports_streaming=True,
+                            thumb=local_thumbnail_filename,
+                            duration=video_duration,
+                            width=width,
+                            height=height,
+                        )
+                        any_item_processed_successfully = True
+                        current_item_processed_this_iteration = True
+                        items_sent_count += 1
+                    except Exception as e:
+                        await message.reply(
+                            f"Error processing video {os.path.basename(item_path_to_process)}: {str(e)}"
+                        )
+                    finally:
+                        if local_thumbnail_filename and os.path.exists(
+                            local_thumbnail_filename
+                        ):
+                            try:
+                                os.remove(local_thumbnail_filename)
+                            except OSError as e_thumb:
+                                print(
+                                    f"Error removing thumbnail {local_thumbnail_filename} for {item_path_to_process}: {e_thumb}"
+                                )
+                elif is_image:
+                    try:
+                        await client.send_photo(
+                            message.chat.id,
+                            photo=item_path_to_process,
+                        )
+                        any_item_processed_successfully = True
+                        current_item_processed_this_iteration = True
+                        items_sent_count += 1
+                    except Exception as e:
+                        await message.reply(
+                            f"Error sending image {os.path.basename(item_path_to_process)}: {str(e)}"
+                        )
 
-            elif is_image:
-                try:
-                    await client.send_photo(
-                        message.chat.id,
-                        photo=item_path_to_process,
-                    )
-                    processed_successfully = True
-                except Exception as e:
-                    await message.reply(
-                        f"Error sending image {os.path.basename(item_path_to_process)}: {str(e)}"
-                    )
-
-            else:  # Not identified as video or image
                 if (
-                    downloaded_media_paths
-                ):  # If gallery-dl downloaded something non-media first
-                    await message.reply(
-                        f"Downloaded a file ({os.path.basename(item_path_to_process)}) that is not a recognized video or image (MIME: {mime_type})."
-                    )
-                # If yt-dlp downloaded something non-media (unlikely with format selection)
-                # This path should ideally not be hit if format selection works.
+                    not current_item_processed_this_iteration
+                ):  # Not video or image, or failed before sending
+                    if (
+                        not use_yt_dlp
+                    ):  # gallery-dl might download non-media files (e.g. .txt)
+                        print(
+                            f"Skipping non-media file from gallery-dl: {os.path.basename(item_path_to_process)} (MIME: {mime_type})"
+                        )
+                    elif not (
+                        is_video or is_image
+                    ):  # yt-dlp downloaded something not explicitly video/image
+                        await message.reply(
+                            f"Downloaded a file ({os.path.basename(item_path_to_process)}) with {downloader_name} that is not a recognized video or image (MIME: {mime_type})."
+                        )
 
-            if not processed_successfully and downloaded_media_paths:
+            # After the loop, provide summary messages
+            if not any_item_processed_successfully and downloaded_media_paths:
+                # This covers cases where download happened but no items could be sent
+                # (e.g., all files were non-media, or all processing attempts failed)
                 await message.reply(
                     f"{downloader_name} downloaded content, but could not process or send any recognized media file."
                 )
+            elif (
+                download_items_from_dir and items_sent_count > 0
+            ):  # gallery-dl processed some items
+                total_items = len(downloaded_media_paths)
+                # Filter out known non-media extensions for a more accurate "media item" count if desired,
+                # but for now, len(downloaded_media_paths) is the count of all files gallery-dl fetched.
+                # A more accurate message might count only actual media files attempted.
+                # For simplicity, we'll use items_sent_count vs total files found in dir.
+                if items_sent_count == total_items:
+                    await message.reply(
+                        f"Finished processing gallery. Sent all {items_sent_count} item(s)."
+                    )
+                else:
+                    # This message implies some files in the gallery download might not have been sendable media
+                    # or encountered errors.
+                    await message.reply(
+                        f"Finished processing gallery. Sent {items_sent_count} item(s) from {total_items} downloaded file(s)."
+                    )
+            # If yt-dlp, individual success (item sent) or failure (error message / 'not recognized media' message) is handled within the loop or by the 'not any_item_processed_successfully' condition.
 
         else:  # Download failed
             error_message = result.get("stderr", "Unknown error")
@@ -242,12 +287,6 @@ async def download_and_upload(client, message, url):
     except Exception as e:
         await message.reply(f"An unexpected error occurred: {str(e)}")
     finally:
-        if thumbnail_filename and os.path.exists(thumbnail_filename):
-            try:
-                os.remove(thumbnail_filename)
-            except OSError as e:
-                print(f"Error removing thumbnail file {thumbnail_filename}: {e}")
-
         if path_to_clean and os.path.exists(path_to_clean):
             try:
                 if is_yt_dlp_download and os.path.isfile(
