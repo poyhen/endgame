@@ -74,7 +74,12 @@ async def download_and_upload(client, message, url):
                 h264_format_selector,
                 url,
             ]
-            print(f"Using yt-dlp for URL: {url}")
+            user_info = f"User {message.from_user.id}"
+            if message.from_user.username:
+                user_info = (
+                    f"User @{message.from_user.username} ({message.from_user.id})"
+                )
+            print(f"{user_info} | Using yt-dlp for URL: {url}")
         else:
             # Use gallery-dl for other URLs (e.g., image galleries)
             download_instance_path = os.path.join(
@@ -94,7 +99,12 @@ async def download_and_upload(client, message, url):
                 download_instance_path,
                 url,
             ]
-            print(f"Using gallery-dl for URL: {url}")
+            user_info = f"User {message.from_user.id}"
+            if message.from_user.username:
+                user_info = (
+                    f"User @{message.from_user.username} ({message.from_user.id})"
+                )
+            print(f"{user_info} | Using gallery-dl for URL: {url}")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -214,8 +224,11 @@ async def download_and_upload(client, message, url):
                             try:
                                 os.remove(local_thumbnail_filename)
                             except OSError as e_thumb:
+                                user_info = f"User {message.from_user.id}"
+                                if message.from_user.username:
+                                    user_info = f"User @{message.from_user.username} ({message.from_user.id})"
                                 print(
-                                    f"Error removing thumbnail {local_thumbnail_filename} for {item_path_to_process}: {e_thumb}"
+                                    f"{user_info} | Error removing thumbnail {local_thumbnail_filename} for {item_path_to_process}: {e_thumb}"
                                 )
                 elif is_image:
                     try:
@@ -237,8 +250,11 @@ async def download_and_upload(client, message, url):
                     if (
                         not use_yt_dlp
                     ):  # gallery-dl might download non-media files (e.g. .txt)
+                        user_info = f"User {message.from_user.id}"
+                        if message.from_user.username:
+                            user_info = f"User @{message.from_user.username} ({message.from_user.id})"
                         print(
-                            f"Skipping non-media file from gallery-dl: {os.path.basename(item_path_to_process)} (MIME: {mime_type})"
+                            f"{user_info} | Skipping non-media file from gallery-dl: {os.path.basename(item_path_to_process)} (MIME: {mime_type})"
                         )
                     elif not (
                         is_video or is_image
@@ -251,8 +267,13 @@ async def download_and_upload(client, message, url):
             if not any_item_processed_successfully and downloaded_media_paths:
                 # This covers cases where download happened but no items could be sent
                 # (e.g., all files were non-media, or all processing attempts failed)
-                await message.reply(
-                    f"{downloader_name} downloaded content, but could not process or send any recognized media file."
+                user_info = f"User {message.from_user.id}"
+                if message.from_user.username:
+                    user_info = (
+                        f"User @{message.from_user.username} ({message.from_user.id})"
+                    )
+                print(
+                    f"{user_info} | {downloader_name} downloaded content, but could not process or send any recognized media file."
                 )
             elif (
                 download_items_from_dir and items_sent_count > 0
@@ -263,14 +284,20 @@ async def download_and_upload(client, message, url):
                 # A more accurate message might count only actual media files attempted.
                 # For simplicity, we'll use items_sent_count vs total files found in dir.
                 if items_sent_count == total_items:
-                    await message.reply(
-                        f"Finished processing gallery. Sent all {items_sent_count} item(s)."
+                    user_info = f"User {message.from_user.id}"
+                    if message.from_user.username:
+                        user_info = f"User @{message.from_user.username} ({message.from_user.id})"
+                    print(
+                        f"{user_info} | Finished processing gallery. Sent all {items_sent_count} item(s)."
                     )
                 else:
                     # This message implies some files in the gallery download might not have been sendable media
                     # or encountered errors.
-                    await message.reply(
-                        f"Finished processing gallery. Sent {items_sent_count} item(s) from {total_items} downloaded file(s)."
+                    user_info = f"User {message.from_user.id}"
+                    if message.from_user.username:
+                        user_info = f"User @{message.from_user.username} ({message.from_user.id})"
+                    print(
+                        f"{user_info} | Finished processing gallery. Sent {items_sent_count} item(s) from {total_items} downloaded file(s)."
                     )
             # If yt-dlp, individual success (item sent) or failure (error message / 'not recognized media' message) is handled within the loop or by the 'not any_item_processed_successfully' condition.
 
@@ -293,12 +320,20 @@ async def download_and_upload(client, message, url):
                     path_to_clean
                 ):  # yt-dlp downloaded a file
                     os.remove(path_to_clean)
-                    print(f"Cleaned up yt-dlp file: {path_to_clean}")
+                    user_info = f"User {message.from_user.id}"
+                    if message.from_user.username:
+                        user_info = f"User @{message.from_user.username} ({message.from_user.id})"
+                    print(f"{user_info} | Cleaned up yt-dlp file: {path_to_clean}")
                 elif not is_yt_dlp_download and os.path.isdir(
                     path_to_clean
                 ):  # gallery-dl downloaded to a dir
                     shutil.rmtree(path_to_clean)
-                    print(f"Cleaned up gallery-dl directory: {path_to_clean}")
+                    user_info = f"User {message.from_user.id}"
+                    if message.from_user.username:
+                        user_info = f"User @{message.from_user.username} ({message.from_user.id})"
+                    print(
+                        f"{user_info} | Cleaned up gallery-dl directory: {path_to_clean}"
+                    )
                 # Edge case: if yt-dlp was supposed to run but path_to_clean is still the base prefix
                 # and no file was actually created and assigned to path_to_clean.
                 elif is_yt_dlp_download and not os.path.isfile(path_to_clean):
@@ -309,11 +344,24 @@ async def download_and_upload(client, message, url):
                     for f_clean in found_files_for_cleanup:
                         try:
                             os.remove(f_clean)
-                            print(f"Cleaned up orphaned yt-dlp file: {f_clean}")
-                        except OSError as e_clean:
+                            user_info = f"User {message.from_user.id}"
+                            if message.from_user.username:
+                                user_info = f"User @{message.from_user.username} ({message.from_user.id})"
                             print(
-                                f"Error cleaning up orphaned yt-dlp file {f_clean}: {e_clean}"
+                                f"{user_info} | Cleaned up orphaned yt-dlp file: {f_clean}"
+                            )
+                        except OSError as e_clean:
+                            user_info = f"User {message.from_user.id}"
+                            if message.from_user.username:
+                                user_info = f"User @{message.from_user.username} ({message.from_user.id})"
+                            print(
+                                f"{user_info} | Error cleaning up orphaned yt-dlp file {f_clean}: {e_clean}"
                             )
 
             except OSError as e:
-                print(f"Error during cleanup of {path_to_clean}: {e}")
+                user_info = f"User {message.from_user.id}"
+                if message.from_user.username:
+                    user_info = (
+                        f"User @{message.from_user.username} ({message.from_user.id})"
+                    )
+                print(f"{user_info} | Error during cleanup of {path_to_clean}: {e}")
