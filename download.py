@@ -22,7 +22,13 @@ async def download_and_upload(client, message, url):
     user_agent = (
         "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"
     )
-    h264_format_selector = "bestvideo[ext=mp4][vcodec=h264]+bestaudio[ext=m4a]/best[ext=mp4][vcodec=h264]/best"
+    # Default format selector, good for YouTube/Instagram as per old logic
+    default_yt_dlp_format_selector = "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    # Platform-specific format selectors
+    PLATFORM_FORMAT_CONFIG = {
+        "tiktok.com": "bestvideo[ext=mp4][vcodec=h264]+bestaudio[ext=m4a]/best[ext=mp4][vcodec=h264]/best"
+        # Add other platform-specific selectors here if needed in the future
+    }
 
     # Paths for cleanup
     # For yt-dlp, it will be a direct file path. For gallery-dl, a directory.
@@ -62,6 +68,13 @@ async def download_and_upload(client, message, url):
                 random_filename_base  # We'll search for files starting with this
             )
 
+            # Determine the format selector for yt-dlp
+            chosen_format_selector = default_yt_dlp_format_selector
+            for domain, fmt_selector in PLATFORM_FORMAT_CONFIG.items():
+                if domain in url:
+                    chosen_format_selector = fmt_selector
+                    break
+
             cmd = [
                 "yt-dlp",
                 "-o",
@@ -71,7 +84,7 @@ async def download_and_upload(client, message, url):
                 "--user-agent",
                 user_agent,
                 "-f",
-                h264_format_selector,
+                chosen_format_selector,
                 url,
             ]
             user_info = f"User {message.from_user.id}"
