@@ -13,3 +13,4 @@ __pycache__
 *.jpg
 .DS_Store
 .glimpse
+gallery_dl_downloads

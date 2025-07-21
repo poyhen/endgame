@@ -41,8 +41,10 @@ async def download_and_upload(client, message, url):
     if (
         "youtube.com/" in url
         or "youtu.be/" in url
+        or "instagram.com/share/" in url
         or "instagram.com/reels/" in url
         or "instagram.com/tv/" in url
+        or "x.com/i/broadcasts/" in url
         or "tiktok.com/" in url
     ):
         use_yt_dlp = True
