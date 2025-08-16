@@ -1,5 +1,5 @@
 from pyrogram import Client
-from config import api_id, api_hash, bot_token, url_pattern, bot_owner
+from config import api_id, api_hash, bot_token, url_pattern, bot_owner, super_users
 from download import download_and_upload
 from utils import check_user_access
 from pyrogram import filters
@@ -35,7 +35,30 @@ async def start(client, message):
         await message.reply(blacklist)
 
 
-@app.on_message(filters.text & ~filters.command("start") & ~filters.command("h"))
+@app.on_message(filters.command("insta"))
+async def handle_insta_command(client, message):
+    """Handle the /insta command to update instagram cookies."""
+    user_id = message.from_user.id
+    if user_id not in super_users:
+        await message.reply("You are not authorized to use this command.")
+        return
+
+    cookie_content = message.text.split(" ", 1)
+    if len(cookie_content) > 1:
+        cookies = cookie_content[1]
+        with open("instacookies.txt", "w") as f:
+            f.write(cookies)
+        await message.reply("Instagram cookies updated successfully.")
+    else:
+        await message.reply("Please provide the cookie content after the command.")
+
+
+@app.on_message(
+    filters.text
+    & ~filters.command("start")
+    & ~filters.command("h")
+    & ~filters.command("insta")
+)
 async def handle_message(client, message):
     """Handle incoming messages."""
     user_id = message.from_user.id

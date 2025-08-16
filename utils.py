@@ -115,6 +115,7 @@ async def get_video_duration(video_file):
     except Exception as e:
         raise e
 
+
 async def get_video_dimensions(video_file):
     """Get the width and height of the video using the new ffprobe command."""
     try:
@@ -153,7 +154,9 @@ async def get_video_dimensions(video_file):
         output = dimensions_result.get("stdout", "").strip()
         lines = output.splitlines()
         if len(lines) != 2:
-            raise Exception(f"expected two lines for width and height, got {len(lines)} lines")
+            raise Exception(
+                f"expected two lines for width and height, got {len(lines)} lines"
+            )
         try:
             width = int(lines[0])
             height = int(lines[1])
@@ -163,3 +166,37 @@ async def get_video_dimensions(video_file):
         return width, height
     except Exception as e:
         raise e
+
+
+def clean_cookie_file(file_path):
+    """
+    Reads a cookie file and reformats it to ensure it's tab-delimited.
+    It handles cookies pasted with spaces instead of tabs.
+    """
+    try:
+        with open(file_path, "r") as f:
+            lines = f.readlines()
+
+        reformatted_lines = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                reformatted_lines.append(line + "\n")
+                continue
+
+            # Split by whitespace, which handles both spaces and tabs,
+            # then join with a single tab.
+            parts = line.split()
+            if len(parts) >= 6:  # Basic validation for a cookie line
+                reformatted_lines.append("\t".join(parts) + "\n")
+
+        # Overwrite the file with the reformatted lines
+        with open(file_path, "w") as f:
+            f.writelines(reformatted_lines)
+
+    except FileNotFoundError:
+        # If the file doesn't exist, there's nothing to clean.
+        pass
+    except Exception as e:
+        # Handle other potential errors, e.g., permissions
+        print(f"Error cleaning cookie file {file_path}: {e}")

@@ -10,7 +10,11 @@ allowed_user_ids = (
     if os.getenv("ALLOWED_USER_IDS")
     else []
 )
-
+super_users = (
+    list(map(int, os.getenv("SUPERUSERS", "").split(",")))
+    if os.getenv("SUPERUSERS")
+    else []
+)
 url_pattern = re.compile(
     r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
 )

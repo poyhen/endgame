@@ -8,6 +8,7 @@ from utils import (
     extract_thumbnail,
     get_video_duration,
     get_video_dimensions,
+    clean_cookie_file,
 )
 
 # Define a base download directory for gallery-dl
@@ -18,7 +19,6 @@ async def download_and_upload(client, message, url):
     """Download media from the URL using yt-dlp for videos and gallery-dl for others."""
 
     # Common variables
-    cookies_file = "cookies.txt"
     user_agent = (
         "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"
     )
@@ -53,6 +53,11 @@ async def download_and_upload(client, message, url):
     # The existing gallery-dl processing logic will handle the downloaded content type.
 
     try:
+        cookies_file = "cookies.txt"
+        if "instagram.com/" in url and os.path.exists("instacookies.txt"):
+            cookies_file = "instacookies.txt"
+            clean_cookie_file(cookies_file)
+
         cmd = []
         download_items_from_dir = (
             False  # True if gallery-dl is used and we need to scan a dir
