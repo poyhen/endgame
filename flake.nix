@@ -1,43 +1,35 @@
 {
-  description = "A simple development environment";
+  description = "A simple development environment (nixpkgs pinned to merged PR #432712)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs =
-    {
-      nixpkgs,
-      flake-utils,
-      ...
-    }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
+  outputs = { self, nixpkgs, flake-utils, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs { inherit system; };
         python = pkgs.python3;
       in
       {
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
+          buildInputs = with pkgs; [
             git
             curl-impersonate-chrome
             ffmpeg
             yt-dlp
             gallery-dl
             ruff
-            (python.withPackages (
-              ps: with ps; [
-                pyrogram
-                tgcrypto
-                uvloop
-                curl-cffi
-                cffi
-                requests
-                aiohttp
-              ]
-            ))
+            (python.withPackages (ps: with ps; [
+              pyrogram
+              tgcrypto
+              uvloop
+              curl-cffi
+              cffi
+              requests
+              aiohttp
+            ]))
           ];
 
           shellHook = ''

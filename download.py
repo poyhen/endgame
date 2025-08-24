@@ -94,6 +94,8 @@ async def download_and_upload(client, message, url):
                 chosen_format_selector,
                 url,
             ]
+            if "youtube.com/" in url or "youtu.be/" in url:
+                cmd.extend(["-t", "mp4"])
             user_info = f"User {message.from_user.id}"
             if message.from_user.username:
                 user_info = (
