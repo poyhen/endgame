@@ -1,14 +1,14 @@
-import os
 import asyncio
 import mimetypes  # For checking file type
+import os
 import shutil  # For removing directories
 
 from utils import (
-    generate_random_filename,
-    extract_thumbnail,
-    get_video_duration,
-    get_video_dimensions,
     clean_cookie_file,
+    extract_thumbnail,
+    generate_random_filename,
+    get_video_dimensions,
+    get_video_duration,
 )
 
 # Define a base download directory for gallery-dl
@@ -53,10 +53,19 @@ async def download_and_upload(client, message, url):
     # The existing gallery-dl processing logic will handle the downloaded content type.
 
     try:
+        # Determine cookies file, defaulting to cookies.txt
+        # Use instacookies.txt for Instagram if it exists
         cookies_file = "cookies.txt"
         if "instagram.com/" in url and os.path.exists("instacookies.txt"):
             cookies_file = "instacookies.txt"
             clean_cookie_file(cookies_file)
+        # For YouTube, ensure cookies.txt is used if it exists
+        elif ("youtube.com/" in url or "youtu.be/" in url) and os.path.exists(
+            "cookies.txt"
+        ):
+            # This branch is primarily for clarity; cookies_file is already "cookies.txt"
+            # We could add specific logic for YouTube cookies here if needed in the future
+            pass
 
         cmd = []
         download_items_from_dir = (
@@ -75,13 +84,7 @@ async def download_and_upload(client, message, url):
                 random_filename_base  # We'll search for files starting with this
             )
 
-            # Determine the format selector for yt-dlp
-            chosen_format_selector = default_yt_dlp_format_selector
-            for domain, fmt_selector in PLATFORM_FORMAT_CONFIG.items():
-                if domain in url:
-                    chosen_format_selector = fmt_selector
-                    break
-
+            # Base command for yt-dlp
             cmd = [
                 "yt-dlp",
                 "-o",
@@ -90,12 +93,23 @@ async def download_and_upload(client, message, url):
                 cookies_file,
                 "--user-agent",
                 user_agent,
-                "-f",
-                chosen_format_selector,
-                url,
             ]
+
+            # Platform-specific format handling
             if "youtube.com/" in url or "youtu.be/" in url:
+                # For YouTube, use '-t' to get a specific container, e.g., mp4
                 cmd.extend(["-t", "mp4"])
+            else:
+                # For other platforms, use the format selector logic
+                chosen_format_selector = default_yt_dlp_format_selector
+                for domain, fmt_selector in PLATFORM_FORMAT_CONFIG.items():
+                    if domain in url:
+                        chosen_format_selector = fmt_selector
+                        break
+                cmd.extend(["-f", chosen_format_selector])
+
+            # Finally, add the URL to the command
+            cmd.append(url)
             user_info = f"User {message.from_user.id}"
             if message.from_user.username:
                 user_info = (

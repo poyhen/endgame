@@ -1,14 +1,6 @@
 import asyncio
-
-# Remove unused import
 import random
 import string
-
-from config import allowed_user_ids
-
-
-def check_user_access(user_id):
-    return user_id in allowed_user_ids
 
 
 def generate_random_filename(extension=""):

@@ -16,11 +16,12 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             git
-            curl-impersonate-chrome
+            curl-impersonate
             ffmpeg
             yt-dlp
             gallery-dl
             ruff
+            deno
             (python.withPackages (ps: with ps; [
               pyrogram
               tgcrypto
