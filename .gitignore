@@ -10,3 +10,8 @@ __pycache__
 *.mp4
 *.webm
 *.mkv
+*.jpg
+.DS_Store
+.glimpse
+gallery_dl_downloads
+instacookies.txt
