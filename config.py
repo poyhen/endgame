@@ -21,7 +21,7 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         allowed_users = optional("ALLOWED_USERS", "").split(",")
-        super_users = optional("SUPERUSERS", "").split(",")
+        super_users = optional("SUPER_USERS", "").split(",")
 
         return cls(
             API_ID=require("API_ID"),
