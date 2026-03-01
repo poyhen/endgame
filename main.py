@@ -1,33 +1,22 @@
 from pyrogram import Client, filters
 
-from config import allowed_user_ids, api_hash, api_id, super_users, url_pattern
+from config import config
+from utils import URL_PATTERN
 from download import download_and_upload
 
-if not api_id or not isinstance(api_id, (int, str)):
-    raise ValueError("API ID must be a non-empty integer or string")
-if not api_hash or not isinstance(api_hash, str):
-    raise ValueError("API Hash must be a non-empty string")
-if not allowed_user_ids:
-    raise ValueError(
-        "ALLOWED_USER_IDS environment variable must be set with at least one user ID"
-    )
 
-app = Client(
-    "userbot",
-    api_id=int(api_id) if isinstance(api_id, str) else api_id,
-    api_hash=str(api_hash),
-)
+app = Client("userbot",api_id=int(config.API_ID),api_hash=config.API_HASH)
 
 
 @app.on_message(
     filters.private
-    & filters.user(allowed_user_ids)
+    & filters.user(config.ALLOWED_USERS)
     & filters.text
     & ~filters.command("h")
 )
 async def handle_message(client, message):
     """Handle incoming messages from allowed users."""
-    urls = url_pattern.findall(message.text)
+    urls = URL_PATTERN.findall(message.text)
 
     if urls:
         await download_and_upload(client, message, urls[0])
@@ -36,11 +25,13 @@ async def handle_message(client, message):
 
 
 @app.on_message(
-    filters.command("insta") & filters.private & filters.user(allowed_user_ids)
+    filters.command("insta") 
+    & filters.private 
+    & filters.user(config.ALLOWED_USERS)
 )
 async def handle_insta_command(client, message):
     """Allow authorized users to refresh Instagram cookies from chat."""
-    authorized_users = super_users or allowed_user_ids
+    authorized_users = config.SUPER_USERS or config.ALLOWED_USERS
     if message.from_user.id not in authorized_users:
         await message.reply("You are not authorized to use this command.", quote=True)
         return
@@ -63,7 +54,10 @@ async def handle_insta_command(client, message):
     await message.reply("Instagram cookies updated successfully.", quote=True)
 
 
-@app.on_message(filters.command("h") & filters.private & filters.user(allowed_user_ids))
+@app.on_message(
+    filters.command("h")
+    & filters.private 
+    & filters.user(config.ALLOWED_USERS))
 async def handle_h_command(client, message):
     """Handle the /h command to check if the bot is alive."""
     await message.reply("alive", quote=True)
