@@ -17,3 +17,8 @@ gallery_dl_downloads
 instacookies.txt
 userbot.session
 userbot.session-journal
+userbot.session-wal
+
+# Added by cargo
+
+/target
