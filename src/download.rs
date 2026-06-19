@@ -8,8 +8,7 @@ use grammers_client::update::Message as UpdateMessage;
 use tokio::process::Command;
 
 use crate::utils::{
-    clean_cookie_file, extract_thumbnail, generate_random_filename, get_video_dimensions,
-    get_video_duration,
+    clean_cookie_file, extract_thumbnail, generate_random_filename, probe_video,
 };
 
 const GALLERY_DL_DOWNLOAD_PATH: &str = "gallery_dl_downloads";
@@ -264,6 +263,7 @@ pub async fn download_and_upload(client: Client, message: UpdateMessage, url: St
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    println!("{info} | Error processing video {name}: {e}");
                     let _ = message
                         .reply(format!("Error processing video {name}: {e}"))
                         .await;
@@ -281,6 +281,7 @@ pub async fn download_and_upload(client: Client, message: UpdateMessage, url: St
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    println!("{info} | Error sending image {name}: {e}");
                     let _ = message
                         .reply(format!("Error sending image {name}: {e}"))
                         .await;
@@ -288,7 +289,7 @@ pub async fn download_and_upload(client: Client, message: UpdateMessage, url: St
             }
         }
 
-        if !processed {
+        if !processed && !is_video && !is_image {
             let name = item
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
@@ -297,7 +298,7 @@ pub async fn download_and_upload(client: Client, message: UpdateMessage, url: St
                 println!(
                     "{info} | Skipping non-media file from gallery-dl: {name} (MIME: {mime_type:?})"
                 );
-            } else if !is_video && !is_image {
+            } else {
                 let _ = message
                     .reply(format!(
                         "Downloaded a file ({name}) with {downloader_name} that is not a recognized video or image (MIME: {mime_type:?})."
@@ -326,16 +327,17 @@ pub async fn download_and_upload(client: Client, message: UpdateMessage, url: St
 }
 
 async fn send_video(client: &Client, message: &UpdateMessage, path: &Path) -> anyhow::Result<()> {
-    let thumb_name = extract_thumbnail(path).await?;
-    let duration = get_video_duration(path).await?;
-    let (width, height) = get_video_dimensions(path).await?;
+    // Metadata and thumbnail are best-effort: a valid video must still be sent
+    // even if probing or thumbnail extraction hiccups. `probe_video` only fails
+    // when the file is not a real/decodable video, which we treat as a hard
+    // error so we never upload garbage masquerading as media.
+    let (duration, width, height) = probe_video(path).await?;
+    let thumb_name = extract_thumbnail(path).await.ok();
 
     let result: anyhow::Result<()> = async {
         let video = client.upload_file(path).await?;
-        let thumb = client.upload_file(&thumb_name).await?;
-        let input = InputMessage::new()
+        let mut input = InputMessage::new()
             .document(video)
-            .thumbnail(thumb)
             .attribute(Attribute::Video {
                 round_message: false,
                 supports_streaming: true,
@@ -343,13 +345,20 @@ async fn send_video(client: &Client, message: &UpdateMessage, path: &Path) -> an
                 w: width,
                 h: height,
             });
+        if let Some(thumb_name) = &thumb_name
+            && let Ok(thumb) = client.upload_file(Path::new(thumb_name)).await
+        {
+            input = input.thumbnail(thumb);
+        }
         message.respond(input).await?;
         Ok(())
     }
     .await;
 
-    if Path::new(&thumb_name).exists() {
-        let _ = std::fs::remove_file(&thumb_name);
+    if let Some(thumb_name) = &thumb_name
+        && Path::new(thumb_name).exists()
+    {
+        let _ = std::fs::remove_file(thumb_name);
     }
 
     result

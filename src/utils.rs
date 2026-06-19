@@ -27,6 +27,10 @@ async fn run(cmd: &mut Command) -> std::io::Result<(bool, String, String)> {
 pub async fn extract_thumbnail(video_file: &Path) -> anyhow::Result<String> {
     let thumbnail_filename = generate_random_filename(".jpg");
 
+    // Extract the frame and scale it in a single pass. The previous code did a
+    // second ffmpeg pass that read from and wrote to the *same* file, which is
+    // unreliable and would sometimes leave an empty/corrupt thumbnail (aborting
+    // the whole upload as a result).
     let (ok, _, stderr) = run(Command::new("ffmpeg")
         .arg("-y")
         .arg("-i")
@@ -35,77 +39,54 @@ pub async fn extract_thumbnail(video_file: &Path) -> anyhow::Result<String> {
         .arg("00:00:01.000")
         .arg("-vframes")
         .arg("1")
+        .arg("-vf")
+        .arg("scale=320:-1")
         .arg(&thumbnail_filename))
     .await?;
     if !ok {
         anyhow::bail!("failed to extract thumbnail. error: {stderr}");
     }
 
-    let (ok, _, stderr) = run(Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(&thumbnail_filename)
-        .arg("-vf")
-        .arg("scale=320:-1")
-        .arg(&thumbnail_filename))
-    .await?;
-    if !ok {
-        anyhow::bail!("failed to resize thumbnail. error: {stderr}");
-    }
-
     Ok(thumbnail_filename)
 }
 
-pub async fn get_video_duration(video_file: &Path) -> anyhow::Result<i64> {
-    let (ok, stdout, stderr) = run(Command::new("ffprobe")
-        .arg("-v")
-        .arg("error")
-        .arg("-show_entries")
-        .arg("format=duration")
-        .arg("-of")
-        .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(video_file))
-    .await?;
-    if !ok {
-        anyhow::bail!("failed to get video duration. error: {stderr}");
-    }
-    let duration: f64 = stdout
-        .trim()
-        .parse()
-        .map_err(|e| anyhow::anyhow!("unable to parse duration from output: {stdout} ({e})"))?;
-    Ok(duration as i64)
-}
-
-pub async fn get_video_dimensions(video_file: &Path) -> anyhow::Result<(i32, i32)> {
+/// Probes a video file, returning `(duration_secs, width, height)`.
+///
+/// This only fails when `ffprobe` itself rejects the file (i.e. it is not a
+/// real/decodable video, e.g. an HTML error page gallery-dl saved with a `.mp4`
+/// name). Unparseable metadata is tolerated and defaults to `0`, so a perfectly
+/// valid video is never dropped just because `ffprobe` printed `N/A` for some
+/// field or emitted the values in an unexpected order.
+pub async fn probe_video(video_file: &Path) -> anyhow::Result<(i64, i32, i32)> {
     let (ok, stdout, stderr) = run(Command::new("ffprobe")
         .arg("-v")
         .arg("error")
         .arg("-select_streams")
         .arg("v:0")
         .arg("-show_entries")
-        .arg("stream=width,height")
+        .arg("stream=width,height:format=duration")
         .arg("-of")
-        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg("default=noprint_wrappers=1")
         .arg(video_file))
     .await?;
     if !ok {
-        anyhow::bail!("failed to get video dimensions. error: {stderr}");
+        anyhow::bail!("ffprobe could not read video. error: {stderr}");
     }
 
-    let lines: Vec<&str> = stdout.lines().collect();
-    if lines.len() != 2 {
-        anyhow::bail!(
-            "expected two lines for width and height, got {} lines",
-            lines.len()
-        );
+    let mut duration = 0i64;
+    let mut width = 0i32;
+    let mut height = 0i32;
+    for line in stdout.lines() {
+        if let Some(v) = line.trim().strip_prefix("width=") {
+            width = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.trim().strip_prefix("height=") {
+            height = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.trim().strip_prefix("duration=") {
+            duration = v.parse::<f64>().map(|f| f as i64).unwrap_or(0);
+        }
     }
-    let width: i32 = lines[0]
-        .parse()
-        .map_err(|_| anyhow::anyhow!("unable to parse dimensions from output: {stdout}"))?;
-    let height: i32 = lines[1]
-        .parse()
-        .map_err(|_| anyhow::anyhow!("unable to parse dimensions from output: {stdout}"))?;
-    Ok((width, height))
+
+    Ok((duration, width, height))
 }
 
 /// Reads a cookie file and reformats it to be tab-delimited.
