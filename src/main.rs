@@ -63,11 +63,14 @@ async fn main() -> AnyResult<()> {
     let super_users = Arc::new(cfg.super_users.clone());
     let url_pattern: Regex = cfg.url_pattern;
 
+    // Don't replay updates that arrived while we were offline. Those would be
+    // links sent during downtime, and reprocessing them all at once on startup
+    // causes massive download/upload spikes. Only handle links that arrive live.
     let mut updates = client
         .stream_updates(
             updates,
             UpdatesConfiguration {
-                catch_up: true,
+                catch_up: false,
                 ..Default::default()
             },
         )
