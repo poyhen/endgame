@@ -80,6 +80,12 @@ struct PreparedVideo {
     _cleanup: Option<TempFileGuard>,
 }
 
+#[derive(Clone, Copy)]
+struct DeliveryPlan {
+    position: (usize, usize),
+    replace_status: bool,
+}
+
 impl PreparedVideo {
     fn original(path: &Path) -> Self {
         Self {
@@ -331,9 +337,7 @@ pub async fn download_and_upload(
     } else {
         let instance_path = Path::new(GALLERY_DL_DOWNLOAD_PATH).join(generate_random_filename(""));
         if let Err(e) = std::fs::create_dir_all(&instance_path) {
-            let _ = message
-                .reply(format!("Failed to create download directory: {e}"))
-                .await;
+            progress.fail(format!("could not create the download directory: {e}"));
             return DownloadOutcome::Failed;
         }
         cleanup_path = Some(instance_path.clone());
@@ -367,11 +371,7 @@ pub async fn download_and_upload(
         if error_message.is_empty() {
             error_message = "Unknown error".to_string();
         }
-        let _ = message
-            .reply(format!(
-                "{downloader_name} failed to download. Error: {error_message}"
-            ))
-            .await;
+        progress.fail(format!("{downloader_name} download error: {error_message}"));
         perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
         return DownloadOutcome::Failed;
     }
@@ -391,11 +391,9 @@ pub async fn download_and_upload(
         if let Some(first) = downloaded.first() {
             cleanup_path = Some(first.clone());
         } else {
-            let _ = message
-                .reply(format!(
-                    "{downloader_name} finished, but the downloaded file was not found (expected prefix: {base})."
-                ))
-                .await;
+            progress.fail(format!(
+                "{downloader_name} finished, but its output file was not found"
+            ));
             perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
             return DownloadOutcome::Failed;
         }
@@ -403,12 +401,9 @@ pub async fn download_and_upload(
         let dir = cleanup_path.clone().unwrap_or_default();
         collect_files(&dir, &mut downloaded);
         if downloaded.is_empty() {
-            let _ = message
-                .reply(format!(
-                    "{downloader_name} downloaded successfully, but no files found in {}. Output: {stdout}",
-                    dir.display()
-                ))
-                .await;
+            progress.fail(format!(
+                "{downloader_name} finished without producing a media file"
+            ));
             perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
             return DownloadOutcome::Failed;
         }
@@ -421,6 +416,7 @@ pub async fn download_and_upload(
 
     let mut any_success = false;
     let mut sent_count = 0usize;
+    let mut last_error: Option<String> = None;
 
     let gallery_media_count = downloaded
         .iter()
@@ -429,6 +425,14 @@ pub async fn download_and_upload(
             is_video || is_image
         })
         .count();
+    let recognized_media_count = downloaded
+        .iter()
+        .filter(|item| {
+            let (is_video, is_image, is_audio, _) = media_kind(item);
+            is_video || is_image || is_audio
+        })
+        .count();
+    let replace_status_with_media = recognized_media_count == 1;
     if !use_yt_dlp && gallery_media_count > 1 {
         let outcome = send_gallery_albums(
             &client,
@@ -453,20 +457,10 @@ pub async fn download_and_upload(
 
         if !item.exists() {
             if !use_yt_dlp {
-                let _ = message
-                    .reply(format!(
-                        "Skipping a downloaded file ({}) as it seems to have disappeared before processing.",
-                        item.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
-                    ))
-                    .await;
+                last_error = Some("a downloaded gallery item disappeared before upload".into());
                 continue;
             } else {
-                let _ = message
-                    .reply(format!(
-                        "Downloaded file {} seems to have disappeared before processing.",
-                        item.display()
-                    ))
-                    .await;
+                progress.fail("the downloaded file disappeared before upload");
                 perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
                 return DownloadOutcome::Failed;
             }
@@ -483,7 +477,10 @@ pub async fn download_and_upload(
                 cancellation,
                 progress,
                 max_upload_bytes,
-                (index + 1, downloaded.len()),
+                DeliveryPlan {
+                    position: (index + 1, downloaded.len()),
+                    replace_status: replace_status_with_media,
+                },
             )
             .await;
             if cancellation.is_cancelled() {
@@ -502,13 +499,19 @@ pub async fn download_and_upload(
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     println!("{info} | Error processing video {name}: {e}");
-                    let _ = message
-                        .reply(format!("Error processing video {name}: {e}"))
-                        .await;
+                    last_error = Some(format!("could not process video {name}: {e}"));
                 }
             }
         } else if is_image {
-            let send_result = send_image(&client, &message, item, cancellation).await;
+            let send_result = send_image(
+                &client,
+                &message,
+                item,
+                cancellation,
+                progress,
+                replace_status_with_media,
+            )
+            .await;
             if cancellation.is_cancelled() {
                 perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
                 return DownloadOutcome::Cancelled;
@@ -525,13 +528,19 @@ pub async fn download_and_upload(
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     println!("{info} | Error sending image {name}: {e}");
-                    let _ = message
-                        .reply(format!("Error sending image {name}: {e}"))
-                        .await;
+                    last_error = Some(format!("could not upload image {name}: {e}"));
                 }
             }
         } else if is_audio {
-            let send_result = send_audio(&client, &message, item, cancellation).await;
+            let send_result = send_audio(
+                &client,
+                &message,
+                item,
+                cancellation,
+                progress,
+                replace_status_with_media,
+            )
+            .await;
             if cancellation.is_cancelled() {
                 perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
                 return DownloadOutcome::Cancelled;
@@ -548,9 +557,7 @@ pub async fn download_and_upload(
                         .map(|file| file.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     log::warn!("{info} | Error sending audio {name}: {error}");
-                    let _ = message
-                        .reply(format!("Error sending audio {name}: {error}"))
-                        .await;
+                    last_error = Some(format!("could not upload audio {name}: {error}"));
                 }
             }
         }
@@ -560,23 +567,23 @@ pub async fn download_and_upload(
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if !use_yt_dlp {
-                println!(
-                    "{info} | Skipping non-media file from gallery-dl: {name} (MIME: {mime_type:?})"
-                );
-            } else {
-                let _ = message
-                    .reply(format!(
-                        "Downloaded a file ({name}) with {downloader_name} that is not a recognized video or image (MIME: {mime_type:?})."
-                    ))
-                    .await;
-            }
+            log::warn!(
+                "{info} | Skipping non-media file from {downloader_name}: {name} (MIME: {mime_type:?})"
+            );
+            last_error = Some(format!(
+                "{downloader_name} produced an unsupported file: {name}"
+            ));
         }
     }
 
     if !any_success && !downloaded.is_empty() {
         println!(
             "{info} | {downloader_name} downloaded content, but could not process or send any recognized media file."
+        );
+        progress.fail(
+            last_error.clone().unwrap_or_else(|| {
+                format!("{downloader_name} produced no supported media to upload")
+            }),
         );
     } else if !use_yt_dlp && sent_count > 0 {
         let total = downloaded.len();
@@ -586,6 +593,14 @@ pub async fn download_and_upload(
             println!(
                 "{info} | Finished processing gallery. Sent {sent_count} item(s) from {total} downloaded file(s)."
             );
+        }
+    }
+
+    if any_success && !replace_status_with_media {
+        if let Some(error) = last_error {
+            progress.complete_with_warning(error);
+        } else {
+            progress.delete_status().await;
         }
     }
 
@@ -741,6 +756,7 @@ async fn send_gallery_albums(
     let total = media_paths.len();
     let mut sent = 0usize;
     let mut cursor = 0usize;
+    let mut last_error: Option<String> = None;
 
     while cursor < total {
         let remaining = total - cursor;
@@ -774,14 +790,12 @@ async fn send_gallery_albums(
                         "{info} | Failed to prepare {} for an album: {error}",
                         path.display()
                     );
-                    let _ = message
-                        .reply(format!(
-                            "Could not prepare {} for upload: {error}",
-                            path.file_name()
-                                .map(|name| name.to_string_lossy())
-                                .unwrap_or_default()
-                        ))
-                        .await;
+                    last_error = Some(format!(
+                        "could not prepare {}: {error}",
+                        path.file_name()
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_default()
+                    ));
                 }
             }
         }
@@ -800,17 +814,21 @@ async fn send_gallery_albums(
             Ok(_) => sent += batch_count,
             Err(error) => {
                 log::warn!("{info} | Failed to send Telegram album: {error}");
-                let _ = message
-                    .reply(format!("Failed to send a media album: {error}"))
-                    .await;
+                last_error = Some(format!("could not upload a media album: {error}"));
             }
         }
     }
 
     if sent > 0 {
         println!("{info} | Finished processing gallery. Sent {sent}/{total} item(s) in albums.");
+        if let Some(error) = last_error {
+            progress.complete_with_warning(error);
+        } else {
+            progress.delete_status().await;
+        }
         DownloadOutcome::Completed
     } else {
+        progress.fail(last_error.unwrap_or_else(|| "gallery contained no uploadable media".into()));
         DownloadOutcome::Failed
     }
 }
@@ -875,7 +893,7 @@ async fn send_video(
     cancellation: &CancellationToken,
     progress: &JobProgress,
     max_upload_bytes: u64,
-    position: (usize, usize),
+    delivery: DeliveryPlan,
 ) -> anyhow::Result<()> {
     // Metadata and thumbnail are best-effort: a valid video must still be sent
     // even if probing or thumbnail extraction hiccups. `probe_video` only fails
@@ -883,7 +901,7 @@ async fn send_video(
     // error so we never upload garbage masquerading as media.
     let prepared = prepare_video(path, cancellation, progress, max_upload_bytes).await?;
     let metadata = probe_video(prepared.path()).await?;
-    progress.uploading(position.0, position.1);
+    progress.uploading(delivery.position.0, delivery.position.1);
     let thumbnail = extract_thumbnail(prepared.path())
         .await
         .ok()
@@ -909,7 +927,7 @@ async fn send_video(
         {
             input = input.thumbnail(thumb);
         }
-        message.respond(input).await?;
+        deliver_media(message, progress, input, delivery.replace_status).await?;
         Ok(())
     }
     .await;
@@ -922,14 +940,21 @@ async fn send_image(
     message: &UpdateMessage,
     path: &Path,
     cancellation: &CancellationToken,
+    progress: &JobProgress,
+    replace_status: bool,
 ) -> anyhow::Result<()> {
     let photo = tokio::select! {
         biased;
         _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
         result = client.upload_file(path) => result?,
     };
-    message.respond(InputMessage::new().photo(photo)).await?;
-    Ok(())
+    deliver_media(
+        message,
+        progress,
+        InputMessage::new().photo(photo),
+        replace_status,
+    )
+    .await
 }
 
 async fn send_audio(
@@ -937,14 +962,61 @@ async fn send_audio(
     message: &UpdateMessage,
     path: &Path,
     cancellation: &CancellationToken,
+    progress: &JobProgress,
+    replace_status: bool,
 ) -> anyhow::Result<()> {
     let audio = tokio::select! {
         biased;
         _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
         result = client.upload_file(path) => result?,
     };
-    message.respond(InputMessage::new().document(audio)).await?;
-    Ok(())
+    deliver_media(
+        message,
+        progress,
+        InputMessage::new().document(audio),
+        replace_status,
+    )
+    .await
+}
+
+async fn deliver_media(
+    source: &UpdateMessage,
+    progress: &JobProgress,
+    media: InputMessage,
+    replace_status: bool,
+) -> anyhow::Result<()> {
+    if !replace_status {
+        source.respond(media).await?;
+        return Ok(());
+    }
+    match progress.replace_with_media(media.clone()).await {
+        Ok(true) => Ok(()),
+        Ok(false) => match source.reply(media).await {
+            Ok(_) => {
+                progress.delete_status().await;
+                Ok(())
+            }
+            Err(send_error) => {
+                progress.resume_text_status();
+                Err(anyhow::anyhow!(
+                    "status was unavailable and fallback media failed: {send_error}"
+                ))
+            }
+        },
+        Err(edit_error) => match source.reply(media).await {
+            Ok(_) => {
+                log::warn!("Could not edit status into media; used fallback send: {edit_error}");
+                progress.delete_status().await;
+                Ok(())
+            }
+            Err(send_error) => {
+                progress.resume_text_status();
+                Err(anyhow::anyhow!(
+                    "could not edit status ({edit_error}) or send fallback media ({send_error})"
+                ))
+            }
+        },
+    }
 }
 
 fn perform_cleanup(

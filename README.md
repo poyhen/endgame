@@ -54,6 +54,11 @@ Each accepted job maintains one status message as it moves through queued,
 downloading, media preparation, uploading, and a terminal state. Cancellation
 is owner-scoped: users cannot cancel or inspect another user's jobs.
 
+For a single image, video, or audio result, that status message is edited into
+the final media message instead of sending a second message. For galleries, the
+album is sent and the temporary status is deleted. Failures and cancellations
+remain visible by editing the same status message.
+
 Videos that are not already MP4/H.264, or that exceed `MAX_UPLOAD_SIZE_MB`, are
 converted to MP4/H.264/AAC with a streaming-friendly layout. Temporary media,
 thumbnails, and cancelled downloads are removed after processing.

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use grammers_client::Client;
-use grammers_client::message::Message as SentMessage;
+use grammers_client::message::{InputMessage, Message as SentMessage};
 use grammers_client::update::Message as UpdateMessage;
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
@@ -54,6 +54,7 @@ pub struct DownloadQueue {
 
 pub enum QueueReply {
     Accepted(JobProgress),
+    Silent,
     Message {
         message: Box<UpdateMessage>,
         text: String,
@@ -72,6 +73,12 @@ struct JobProgressInner {
     phase: Mutex<JobPhase>,
     last_render: Mutex<Option<String>>,
     flushing: AtomicBool,
+    edit_lock: tokio::sync::Mutex<()>,
+    status_ready: Notify,
+    attachment_done: AtomicBool,
+    final_media: AtomicBool,
+    delete_when_attached: AtomicBool,
+    failure: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,10 +222,7 @@ impl DownloadQueueHandle {
             job.progress.set_phase(JobPhase::Cancelled);
             drop(state);
             self.shared.changed.notify_one();
-            return QueueReply::Message {
-                message: Box::new(message),
-                text: format!("Cancelled queued job #{id}."),
-            };
+            return QueueReply::Silent;
         }
 
         if let Some(job) = state
@@ -230,10 +234,7 @@ impl DownloadQueueHandle {
             job.cancellation.cancel();
             job.progress.set_phase(JobPhase::Cancelling);
             drop(state);
-            return QueueReply::Message {
-                message: Box::new(message),
-                text: format!("Cancellation requested for active job #{id}."),
-            };
+            return QueueReply::Silent;
         }
 
         QueueReply::message(
@@ -244,6 +245,10 @@ impl DownloadQueueHandle {
 }
 
 impl QueueReply {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted(_))
+    }
+
     fn message(message: UpdateMessage, text: impl Into<String>) -> Self {
         Self::Message {
             message: Box::new(message),
@@ -254,6 +259,7 @@ impl QueueReply {
     pub async fn send(self) {
         match self {
             Self::Accepted(progress) => progress.attach().await,
+            Self::Silent => {}
             Self::Message { message, text } => {
                 let _ = message.reply(text).await;
             }
@@ -271,6 +277,12 @@ impl JobProgress {
                 phase: Mutex::new(JobPhase::Queued),
                 last_render: Mutex::new(None),
                 flushing: AtomicBool::new(false),
+                edit_lock: tokio::sync::Mutex::new(()),
+                status_ready: Notify::new(),
+                attachment_done: AtomicBool::new(false),
+                final_media: AtomicBool::new(false),
+                delete_when_attached: AtomicBool::new(false),
+                failure: Mutex::new(None),
             }),
         }
     }
@@ -287,16 +299,123 @@ impl JobProgress {
         self.set_phase(JobPhase::Processing);
     }
 
+    pub fn fail(&self, reason: impl Into<String>) {
+        let reason = truncate_failure(reason.into());
+        *lock(&self.inner.failure) = Some(reason);
+        self.set_phase(JobPhase::Failed);
+    }
+
+    pub fn complete_with_warning(&self, reason: impl Into<String>) {
+        let reason = truncate_failure(reason.into());
+        *lock(&self.inner.failure) = Some(reason);
+        self.set_phase(JobPhase::Completed);
+    }
+
+    pub async fn replace_with_media(&self, message: InputMessage) -> anyhow::Result<bool> {
+        self.inner.final_media.store(true, Ordering::Release);
+        let Some(status) = self.wait_for_status().await else {
+            return Ok(false);
+        };
+
+        let _edit_guard = self.inner.edit_lock.lock().await;
+        status.edit(message).await?;
+        Ok(true)
+    }
+
+    pub async fn delete_status(&self) {
+        self.inner.final_media.store(true, Ordering::Release);
+        self.inner
+            .delete_when_attached
+            .store(true, Ordering::Release);
+        let Some(status) = self.wait_for_status().await else {
+            return;
+        };
+
+        let edit_guard = self.inner.edit_lock.lock().await;
+        let deletion = status.delete().await;
+        if deletion.is_ok() {
+            *lock(&self.inner.status) = None;
+            return;
+        }
+
+        log::warn!("Failed to delete completed job status: {deletion:?}");
+        self.inner.final_media.store(false, Ordering::Release);
+        self.inner
+            .delete_when_attached
+            .store(false, Ordering::Release);
+        drop(edit_guard);
+        self.set_phase(JobPhase::Completed);
+        self.schedule_flush();
+    }
+
+    pub fn resume_text_status(&self) {
+        self.inner.final_media.store(false, Ordering::Release);
+        self.inner
+            .delete_when_attached
+            .store(false, Ordering::Release);
+        self.schedule_flush();
+    }
+
     async fn attach(&self) {
         let initial = self.render();
         match self.inner.source.reply(initial.clone()).await {
             Ok(status) => {
                 *lock(&self.inner.status) = Some(status.clone());
                 *lock(&self.inner.last_render) = Some(initial);
-                self.schedule_flush();
+                self.inner.attachment_done.store(true, Ordering::Release);
+                self.inner.status_ready.notify_waiters();
+                if self.inner.delete_when_attached.load(Ordering::Acquire) {
+                    let edit_guard = self.inner.edit_lock.lock().await;
+                    let deletion = status.delete().await;
+                    if deletion.is_ok() {
+                        *lock(&self.inner.status) = None;
+                    } else {
+                        self.inner.final_media.store(false, Ordering::Release);
+                        self.inner
+                            .delete_when_attached
+                            .store(false, Ordering::Release);
+                        drop(edit_guard);
+                        self.set_phase(JobPhase::Completed);
+                        self.schedule_flush();
+                    }
+                } else {
+                    self.schedule_flush();
+                }
             }
-            Err(error) => log::warn!("Failed to create job status message: {error}"),
+            Err(error) => {
+                self.inner.attachment_done.store(true, Ordering::Release);
+                self.inner.status_ready.notify_waiters();
+                log::warn!("Failed to create job status message: {error}");
+            }
         }
+    }
+
+    async fn wait_for_status(&self) -> Option<SentMessage> {
+        let wait = async {
+            loop {
+                if let Some(status) = lock(&self.inner.status).clone() {
+                    return Some(status);
+                }
+                if self.inner.attachment_done.load(Ordering::Acquire) {
+                    return None;
+                }
+
+                let notified = self.inner.status_ready.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if lock(&self.inner.status).is_some()
+                    || self.inner.attachment_done.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                notified.await;
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .ok()
+            .flatten()
     }
 
     fn set_phase(&self, new_phase: JobPhase) {
@@ -315,7 +434,10 @@ impl JobProgress {
     }
 
     fn schedule_flush(&self) {
-        if lock(&self.inner.status).is_none() || self.inner.flushing.swap(true, Ordering::AcqRel) {
+        if self.inner.final_media.load(Ordering::Acquire)
+            || lock(&self.inner.status).is_none()
+            || self.inner.flushing.swap(true, Ordering::AcqRel)
+        {
             return;
         }
 
@@ -325,18 +447,19 @@ impl JobProgress {
 
     async fn flush(self) {
         loop {
+            let _edit_guard = self.inner.edit_lock.lock().await;
+            if self.inner.final_media.load(Ordering::Acquire) {
+                self.inner.flushing.store(false, Ordering::Release);
+                break;
+            }
             let desired = self.render();
             let status = lock(&self.inner.status).clone();
             let last_render = lock(&self.inner.last_render).clone();
             if last_render.as_deref() != Some(&desired)
                 && let Some(status) = status
             {
-                let edit = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    status.edit(desired.clone()),
-                )
-                .await;
-                if matches!(edit, Ok(Ok(()))) {
+                let edit = status.edit(desired.clone()).await;
+                if edit.is_ok() {
                     *lock(&self.inner.last_render) = Some(desired.clone());
                 }
             }
@@ -362,8 +485,14 @@ impl JobProgress {
             ),
             JobPhase::Cancelling => format!("Job #{} is cancelling…", self.inner.id),
             JobPhase::Cancelled => format!("Job #{} was cancelled.", self.inner.id),
-            JobPhase::Completed => format!("Job #{} completed.", self.inner.id),
-            JobPhase::Failed => format!("Job #{} failed.", self.inner.id),
+            JobPhase::Completed => match lock(&self.inner.failure).as_deref() {
+                Some(reason) => format!("Job #{} completed with warnings: {reason}", self.inner.id),
+                None => format!("Job #{} completed.", self.inner.id),
+            },
+            JobPhase::Failed => match lock(&self.inner.failure).as_deref() {
+                Some(reason) => format!("Job #{} failed: {reason}", self.inner.id),
+                None => format!("Job #{} failed.", self.inner.id),
+            },
         }
     }
 }
@@ -474,9 +603,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn truncate_failure(reason: String) -> String {
+    if reason.chars().count() > 500 {
+        format!("{}...", reason.chars().take(497).collect::<String>())
+    } else {
+        reason
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::JobPhase;
+    use super::{JobPhase, truncate_failure};
 
     #[test]
     fn only_final_phases_are_terminal() {
@@ -500,5 +637,13 @@ mod tests {
         );
         assert!(JobPhase::Cancelling.can_transition_to(&JobPhase::Cancelled));
         assert!(JobPhase::Cancelling.can_transition_to(&JobPhase::Completed));
+    }
+
+    #[test]
+    fn failure_text_truncation_is_unicode_safe() {
+        let reason = "🙂".repeat(600);
+        let truncated = truncate_failure(reason);
+        assert_eq!(truncated.chars().count(), 500);
+        assert!(truncated.ends_with("..."));
     }
 }

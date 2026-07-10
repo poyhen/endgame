@@ -173,7 +173,11 @@ async fn main() -> AnyResult<()> {
                         break;
                     }
                     let reply = download_queue_handle.try_enqueue(message.clone(), uid, url);
-                    spawn_handler(&mut handler_tasks, reply.send());
+                    if reply.is_accepted() {
+                        spawn_definitive_handler(&mut handler_tasks, reply.send());
+                    } else {
+                        spawn_handler(&mut handler_tasks, reply.send());
+                    }
                 }
             }
             MessageAction::Cancel(Some(id)) => {
@@ -288,6 +292,17 @@ where
             log::warn!("Telegram acknowledgement timed out");
         }
     });
+}
+
+fn spawn_definitive_handler<F>(tasks: &mut JoinSet<()>, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if tasks.len() >= MAX_HANDLER_TASKS {
+        log::warn!("Dropping a Telegram acknowledgement because the handler limit was reached");
+        return;
+    }
+    tasks.spawn(future);
 }
 
 async fn handle_insta(message: &UpdateMessage, text: &str, sender_id: i64, super_users: &[i64]) {
