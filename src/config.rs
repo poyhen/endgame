@@ -9,6 +9,9 @@ pub struct Config {
     pub download_concurrency: usize,
     pub download_queue_capacity: usize,
     pub max_upload_size_mb: usize,
+    pub command_timeout_secs: usize,
+    pub upload_timeout_secs: usize,
+    pub job_timeout_secs: usize,
 }
 
 fn parse_id_list(value: &str) -> Result<Vec<i64>, String> {
@@ -75,6 +78,18 @@ impl Config {
             "MAX_UPLOAD_SIZE_MB",
             &std::env::var("MAX_UPLOAD_SIZE_MB").unwrap_or_else(|_| "1900".to_string()),
         )?;
+        let command_timeout_secs = parse_positive_usize(
+            "COMMAND_TIMEOUT_SECS",
+            &std::env::var("COMMAND_TIMEOUT_SECS").unwrap_or_else(|_| "10800".to_string()),
+        )?;
+        let upload_timeout_secs = parse_positive_usize(
+            "UPLOAD_TIMEOUT_SECS",
+            &std::env::var("UPLOAD_TIMEOUT_SECS").unwrap_or_else(|_| "7200".to_string()),
+        )?;
+        let job_timeout_secs = parse_positive_usize(
+            "JOB_TIMEOUT_SECS",
+            &std::env::var("JOB_TIMEOUT_SECS").unwrap_or_else(|_| "21600".to_string()),
+        )?;
 
         Ok(Self {
             api_id,
@@ -85,6 +100,9 @@ impl Config {
             download_concurrency,
             download_queue_capacity,
             max_upload_size_mb,
+            command_timeout_secs,
+            upload_timeout_secs,
+            job_timeout_secs,
         })
     }
 }

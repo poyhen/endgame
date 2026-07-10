@@ -1,7 +1,10 @@
 use std::path::Path;
+use std::time::Duration;
 
 use rand::seq::SliceRandom;
 use tokio::process::Command;
+
+use crate::cancel::CancellationToken;
 
 const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
@@ -15,9 +18,20 @@ pub fn generate_random_filename(ext: &str) -> String {
     s
 }
 
-async fn run(cmd: &mut Command) -> std::io::Result<(bool, String, String)> {
+async fn run(
+    cmd: &mut Command,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+) -> anyhow::Result<(bool, String, String)> {
     cmd.kill_on_drop(true);
-    let out = cmd.output().await?;
+    let out = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
+        _ = tokio::time::sleep(timeout) => {
+            anyhow::bail!("command timed out after {} seconds", timeout.as_secs())
+        },
+        result = cmd.output() => result?,
+    };
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -25,7 +39,11 @@ async fn run(cmd: &mut Command) -> std::io::Result<(bool, String, String)> {
     ))
 }
 
-pub async fn extract_thumbnail(video_file: &Path) -> anyhow::Result<String> {
+pub async fn extract_thumbnail(
+    video_file: &Path,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+) -> anyhow::Result<String> {
     let thumbnail_filename = generate_random_filename(".jpg");
     let mut cleanup = GeneratedFile::new(&thumbnail_filename);
 
@@ -33,17 +51,21 @@ pub async fn extract_thumbnail(video_file: &Path) -> anyhow::Result<String> {
     // second ffmpeg pass that read from and wrote to the *same* file, which is
     // unreliable and would sometimes leave an empty/corrupt thumbnail (aborting
     // the whole upload as a result).
-    let (ok, _, stderr) = run(Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(video_file)
-        .arg("-ss")
-        .arg("00:00:01.000")
-        .arg("-vframes")
-        .arg("1")
-        .arg("-vf")
-        .arg("scale=320:-1")
-        .arg(&thumbnail_filename))
+    let (ok, _, stderr) = run(
+        Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-i")
+            .arg(video_file)
+            .arg("-ss")
+            .arg("00:00:01.000")
+            .arg("-vframes")
+            .arg("1")
+            .arg("-vf")
+            .arg("scale=320:-1")
+            .arg(&thumbnail_filename),
+        cancellation,
+        timeout,
+    )
     .await?;
     if !ok {
         anyhow::bail!("failed to extract thumbnail. error: {stderr}");
@@ -93,17 +115,25 @@ pub struct VideoMetadata {
 /// name). Unparseable metadata is tolerated and defaults to `0`, so a perfectly
 /// valid video is never dropped just because `ffprobe` printed `N/A` for some
 /// field or emitted the values in an unexpected order.
-pub async fn probe_video(video_file: &Path) -> anyhow::Result<VideoMetadata> {
-    let (ok, stdout, stderr) = run(Command::new("ffprobe")
-        .arg("-v")
-        .arg("error")
-        .arg("-select_streams")
-        .arg("v:0")
-        .arg("-show_entries")
-        .arg("stream=width,height,codec_name:format=duration")
-        .arg("-of")
-        .arg("default=noprint_wrappers=1")
-        .arg(video_file))
+pub async fn probe_video(
+    video_file: &Path,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+) -> anyhow::Result<VideoMetadata> {
+    let (ok, stdout, stderr) = run(
+        Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-select_streams")
+            .arg("v:0")
+            .arg("-show_entries")
+            .arg("stream=width,height,codec_name:format=duration")
+            .arg("-of")
+            .arg("default=noprint_wrappers=1")
+            .arg(video_file),
+        cancellation,
+        timeout,
+    )
     .await?;
     if !ok {
         anyhow::bail!("ffprobe could not read video. error: {stderr}");

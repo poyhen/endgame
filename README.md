@@ -30,8 +30,11 @@ The bot reads configuration from environment variables.
 | `DOWNLOAD_CONCURRENCY` | No | `2` | Maximum simultaneous download jobs |
 | `DOWNLOAD_QUEUE_CAPACITY` | No | `20` | Maximum jobs waiting in the queue |
 | `MAX_UPLOAD_SIZE_MB` | No | `1900` | Video size ceiling before adaptive transcoding |
+| `COMMAND_TIMEOUT_SECS` | No | `10800` | Deadline for yt-dlp, gallery-dl, and full video transcodes |
+| `UPLOAD_TIMEOUT_SECS` | No | `7200` | Deadline for each Telegram media upload |
+| `JOB_TIMEOUT_SECS` | No | `21600` | Overall deadline for one queued job after it starts |
 
-Both queue settings and the upload limit must be positive integers.
+Queue settings, the upload limit, and timeout values must be positive integers.
 
 ## Usage
 
@@ -51,11 +54,17 @@ Both queue settings and the upload limit must be positive integers.
   permissions on Unix systems.
 
 Each accepted job maintains one status message as it moves through queued,
-downloading, media preparation, uploading, and a terminal state. Cancellation
+downloading, inspection, transcoding, thumbnail preparation, uploading,
+finalization, and a terminal state. yt-dlp downloads and transcodes report
+progress in five-percent steps. Cancellation
 is owner-scoped: users cannot cancel or inspect another user's jobs.
 While primary media is uploading, the status includes the current item's
 percentage and estimated bytes remaining. Progress edits are throttled to avoid
 excessive Telegram requests; thumbnail uploads are not included.
+
+Status edits and other Telegram delivery operations have bounded waits, while
+failed status edits are retried without blocking the media worker. `/status`
+shows each caller's active job phase and how long it has been in that phase.
 
 For a single image, video, or audio result, that status message is edited into
 the final media message instead of sending a second message. For galleries, the
@@ -65,6 +74,14 @@ remain visible by editing the same status message.
 Videos that are not already MP4/H.264, or that exceed `MAX_UPLOAD_SIZE_MB`, are
 converted to MP4/H.264/AAC with a streaming-friendly layout. Temporary media,
 thumbnails, and cancelled downloads are removed after processing.
+For YouTube, the downloader first prefers an H.264 MP4 format estimated to fit
+under the upload ceiling, which avoids needless multi-hour transcodes when a
+slightly lower compatible format is available. Playlist expansion is disabled;
+each submitted URL remains one job.
+
+External commands, uploads, and whole jobs are watched by configurable
+deadlines. Logs include job phase transitions plus command PID and elapsed time,
+and a panicking worker is converted into a visible failed job.
 
 On Ctrl-C, new work is rejected and accepted jobs are drained before the
 Telegram connection closes.

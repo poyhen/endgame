@@ -8,7 +8,7 @@ use grammers_client::Client;
 use grammers_client::media::{Attribute, InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
 use grammers_client::update::Message as UpdateMessage;
-use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 use tokio::process::Command;
 
 use crate::cancel::CancellationToken;
@@ -23,6 +23,17 @@ const DEFAULT_YT_DLP_FORMAT_SELECTOR: &str =
     "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
 
 const UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const TELEGRAM_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const UTILITY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct DownloadLimits {
+    pub max_upload_bytes: u64,
+    pub command_timeout: Duration,
+    pub upload_timeout: Duration,
+    pub job_timeout: Duration,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownloadRequest {
@@ -65,9 +76,18 @@ enum CommandOutcome {
         stderr: String,
     },
     Cancelled,
+    TimedOut,
 }
 
 struct TempFileGuard(PathBuf);
+
+enum CommandProgress {
+    Download(JobProgress),
+    Transcode {
+        progress: JobProgress,
+        duration_micros: u64,
+    },
+}
 
 struct ProgressReader<R> {
     inner: R,
@@ -216,7 +236,14 @@ fn should_use_yt_dlp(url: &str) -> bool {
     .any(|d| url.contains(d))
 }
 
-async fn run_command(mut cmd: Command, cancellation: &CancellationToken) -> CommandOutcome {
+async fn run_command(
+    mut cmd: Command,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    job_id: u64,
+    command_progress: Option<CommandProgress>,
+) -> CommandOutcome {
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     cmd.kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -232,44 +259,69 @@ async fn run_command(mut cmd: Command, cancellation: &CancellationToken) -> Comm
             };
         }
     };
+    let pid = child.id();
+    let started = Instant::now();
+    log::info!("Job #{job_id} started {program} (pid={pid:?})");
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
         if let Some(mut stdout) = stdout {
-            let _ = stdout.read_to_end(&mut bytes).await;
+            match command_progress {
+                Some(CommandProgress::Download(progress)) => {
+                    read_ytdlp_progress(stdout, progress).await
+                }
+                Some(CommandProgress::Transcode {
+                    progress,
+                    duration_micros,
+                }) => read_ffmpeg_progress(stdout, progress, duration_micros).await,
+                None => read_bounded_output(&mut stdout).await,
+            }
+        } else {
+            Vec::new()
         }
-        bytes
     });
     let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
         if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_end(&mut bytes).await;
+            read_bounded_output(&mut stderr).await
+        } else {
+            Vec::new()
         }
-        bytes
     });
 
-    let (cancelled, status) = tokio::select! {
+    enum StopReason {
+        Finished,
+        Cancelled,
+        TimedOut,
+    }
+
+    let (reason, status) = tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                let _ = Command::new("/bin/kill")
-                    .arg("-KILL")
-                    .arg("--")
-                    .arg(format!("-{pid}"))
-                    .status()
-                    .await;
-            }
-            let _ = child.kill().await;
-            (true, child.wait().await)
+            terminate_child(&mut child).await;
+            (StopReason::Cancelled, child.wait().await)
         },
-        result = child.wait() => (false, result),
+        _ = tokio::time::sleep(timeout) => {
+            terminate_child(&mut child).await;
+            (StopReason::TimedOut, child.wait().await)
+        },
+        result = child.wait() => (StopReason::Finished, result),
     };
-    let stdout = collect_reader(stdout_task, cancelled).await;
-    let stderr = collect_reader(stderr_task, cancelled).await;
-    if cancelled {
-        return CommandOutcome::Cancelled;
+    let interrupted = !matches!(reason, StopReason::Finished);
+    let stdout = collect_reader(stdout_task, interrupted).await;
+    let stderr = collect_reader(stderr_task, interrupted).await;
+    log::info!(
+        "Job #{job_id} {program} ended after {:.1}s ({})",
+        started.elapsed().as_secs_f64(),
+        match reason {
+            StopReason::Finished => "finished",
+            StopReason::Cancelled => "cancelled",
+            StopReason::TimedOut => "timed out",
+        }
+    );
+    match reason {
+        StopReason::Cancelled => return CommandOutcome::Cancelled,
+        StopReason::TimedOut => return CommandOutcome::TimedOut,
+        StopReason::Finished => {}
     }
 
     match status {
@@ -286,12 +338,144 @@ async fn run_command(mut cmd: Command, cancellation: &CancellationToken) -> Comm
     }
 }
 
-async fn collect_reader(mut task: tokio::task::JoinHandle<Vec<u8>>, cancelled: bool) -> Vec<u8> {
-    if !cancelled {
-        return task.await.unwrap_or_default();
+async fn terminate_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg("--")
+            .arg(format!("-{pid}"))
+            .status()
+            .await;
     }
+    let _ = child.kill().await;
+}
 
-    match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+async fn read_bounded_output(reader: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+    let mut output = Vec::with_capacity(COMMAND_OUTPUT_LIMIT);
+    let mut buffer = [0u8; 8192];
+    while let Ok(read) = reader.read(&mut buffer).await {
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..read]);
+        if output.len() > COMMAND_OUTPUT_LIMIT * 2 {
+            let excess = output.len() - COMMAND_OUTPUT_LIMIT;
+            output.drain(..excess);
+        }
+    }
+    if output.len() > COMMAND_OUTPUT_LIMIT {
+        let excess = output.len() - COMMAND_OUTPUT_LIMIT;
+        output.drain(..excess);
+    }
+    output
+}
+
+async fn read_ffmpeg_progress(
+    reader: impl AsyncRead + Unpin,
+    progress: JobProgress,
+    duration_micros: u64,
+) -> Vec<u8> {
+    let mut reader = BufReader::new(reader);
+    let mut output = Vec::with_capacity(COMMAND_OUTPUT_LIMIT);
+    let mut line = Vec::new();
+    let mut last_bucket = 0u8;
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut line).await else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&line);
+        if output.len() > COMMAND_OUTPUT_LIMIT * 2 {
+            let excess = output.len() - COMMAND_OUTPUT_LIMIT;
+            output.drain(..excess);
+        }
+
+        if let Some(percent) = transcode_percent(&line, duration_micros) {
+            let bucket = percent / 5 * 5;
+            if bucket >= last_bucket.saturating_add(5) {
+                last_bucket = bucket;
+                progress.transcoding(Some(bucket));
+            }
+        }
+    }
+    if output.len() > COMMAND_OUTPUT_LIMIT {
+        let excess = output.len() - COMMAND_OUTPUT_LIMIT;
+        output.drain(..excess);
+    }
+    output
+}
+
+async fn read_ytdlp_progress(reader: impl AsyncRead + Unpin, progress: JobProgress) -> Vec<u8> {
+    let mut reader = BufReader::new(reader);
+    let mut output = Vec::with_capacity(COMMAND_OUTPUT_LIMIT);
+    let mut line = Vec::new();
+    let mut last_bucket = 0u8;
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut line).await else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&line);
+        if output.len() > COMMAND_OUTPUT_LIMIT * 2 {
+            let excess = output.len() - COMMAND_OUTPUT_LIMIT;
+            output.drain(..excess);
+        }
+        if let Some(percent) = download_percent(&line) {
+            let bucket = percent / 5 * 5;
+            if bucket >= last_bucket.saturating_add(5) {
+                last_bucket = bucket;
+                progress.download_progress(bucket);
+            }
+        }
+    }
+    if output.len() > COMMAND_OUTPUT_LIMIT {
+        let excess = output.len() - COMMAND_OUTPUT_LIMIT;
+        output.drain(..excess);
+    }
+    output
+}
+
+fn download_percent(line: &[u8]) -> Option<u8> {
+    let text = String::from_utf8_lossy(line);
+    let value = text
+        .trim()
+        .strip_prefix("download:")?
+        .trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    Some(value.clamp(0.0, 100.0) as u8)
+}
+
+fn transcode_percent(line: &[u8], duration_micros: u64) -> Option<u8> {
+    if duration_micros == 0 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(line);
+    let elapsed = text
+        .trim()
+        .strip_prefix("out_time_us=")
+        .or_else(|| text.trim().strip_prefix("out_time_ms="))?
+        .parse::<u64>()
+        .ok()?;
+    Some(((elapsed as u128 * 100) / duration_micros as u128).min(99) as u8)
+}
+
+async fn collect_reader(mut task: tokio::task::JoinHandle<Vec<u8>>, cancelled: bool) -> Vec<u8> {
+    let timeout = if cancelled {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(5)
+    };
+    match tokio::time::timeout(timeout, &mut task).await {
         Ok(result) => result.unwrap_or_default(),
         Err(_) => {
             task.abort();
@@ -346,6 +530,7 @@ async fn upload_file_with_progress(
     cancellation: &CancellationToken,
     progress: &JobProgress,
     position: (usize, usize),
+    upload_timeout: Duration,
 ) -> anyhow::Result<Uploaded> {
     let file = tokio::fs::File::open(path).await?;
     let total_bytes = file.metadata().await?.len();
@@ -360,6 +545,10 @@ async fn upload_file_with_progress(
     let uploaded = tokio::select! {
         biased;
         _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
+        _ = tokio::time::sleep(upload_timeout) => anyhow::bail!(
+            "Telegram upload timed out after {} seconds",
+            upload_timeout.as_secs()
+        ),
         result = client.upload_stream(&mut reader, size, name) => result?,
     };
     progress.upload_progress(position.0, position.1, total_bytes, total_bytes);
@@ -372,7 +561,7 @@ pub async fn download_and_upload(
     request: DownloadRequest,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    max_upload_bytes: u64,
+    limits: DownloadLimits,
 ) -> DownloadOutcome {
     if cancellation.is_cancelled() {
         return DownloadOutcome::Cancelled;
@@ -405,7 +594,10 @@ pub async fn download_and_upload(
             .arg("--cookies")
             .arg(&cookies_file)
             .arg("--user-agent")
-            .arg(USER_AGENT);
+            .arg(USER_AGENT)
+            .arg("--newline")
+            .arg("--progress-template")
+            .arg("download:download:%(progress._percent_str)s");
 
         if matches!(&mode, DownloadMode::Audio) {
             cmd.arg("--extract-audio")
@@ -413,13 +605,18 @@ pub async fn download_and_upload(
                 .arg("mp3")
                 .arg("--audio-quality")
                 .arg("0");
+        } else if url.contains("youtube.com/") || url.contains("youtu.be/") {
+            let max_height = match &mode {
+                DownloadMode::Video { max_height } => *max_height,
+                DownloadMode::Audio => None,
+            };
+            cmd.arg("-f")
+                .arg(youtube_format_selector(limits.max_upload_bytes, max_height));
         } else if let DownloadMode::Video {
             max_height: Some(height),
         } = &mode
         {
             cmd.arg("-f").arg(video_format_selector(*height));
-        } else if url.contains("youtube.com/") || url.contains("youtu.be/") {
-            cmd.arg("-t").arg("mp4");
         } else {
             let mut chosen = DEFAULT_YT_DLP_FORMAT_SELECTOR.to_string();
             for (domain, fmt) in [(
@@ -433,7 +630,7 @@ pub async fn download_and_upload(
             }
             cmd.arg("-f").arg(&chosen);
         }
-        cmd.arg(&url);
+        cmd.arg("--no-playlist").arg(&url);
         println!("{info} | Using yt-dlp for URL: {url}");
     } else {
         let instance_path = Path::new(GALLERY_DL_DOWNLOAD_PATH).join(generate_random_filename(""));
@@ -452,7 +649,15 @@ pub async fn download_and_upload(
         println!("{info} | Using gallery-dl for URL: {url}");
     }
 
-    let (success, stdout, stderr) = match run_command(cmd, cancellation).await {
+    let (success, stdout, stderr) = match run_command(
+        cmd,
+        cancellation,
+        limits.command_timeout,
+        progress.id(),
+        use_yt_dlp.then(|| CommandProgress::Download(progress.clone())),
+    )
+    .await
+    {
         CommandOutcome::Finished {
             success,
             stdout,
@@ -461,6 +666,14 @@ pub async fn download_and_upload(
         CommandOutcome::Cancelled => {
             perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
             return DownloadOutcome::Cancelled;
+        }
+        CommandOutcome::TimedOut => {
+            progress.fail(format!(
+                "{downloader_name} timed out after {} seconds",
+                limits.command_timeout.as_secs()
+            ));
+            perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
+            return DownloadOutcome::Failed;
         }
     };
 
@@ -542,7 +755,7 @@ pub async fn download_and_upload(
             cancellation,
             progress,
             &info,
-            max_upload_bytes,
+            limits,
         )
         .await;
         perform_cleanup(&cleanup_path, &yt_dlp_base, use_yt_dlp, &info);
@@ -577,7 +790,7 @@ pub async fn download_and_upload(
                 item,
                 cancellation,
                 progress,
-                max_upload_bytes,
+                limits,
                 DeliveryPlan {
                     position: (index + 1, downloaded.len()),
                     replace_status: replace_status_with_media,
@@ -610,8 +823,11 @@ pub async fn download_and_upload(
                 item,
                 cancellation,
                 progress,
-                replace_status_with_media,
-                (index + 1, downloaded.len()),
+                limits,
+                DeliveryPlan {
+                    position: (index + 1, downloaded.len()),
+                    replace_status: replace_status_with_media,
+                },
             )
             .await;
             if cancellation.is_cancelled() {
@@ -640,8 +856,11 @@ pub async fn download_and_upload(
                 item,
                 cancellation,
                 progress,
-                replace_status_with_media,
-                (index + 1, downloaded.len()),
+                limits,
+                DeliveryPlan {
+                    position: (index + 1, downloaded.len()),
+                    replace_status: replace_status_with_media,
+                },
             )
             .await;
             if cancellation.is_cancelled() {
@@ -721,13 +940,34 @@ fn video_format_selector(max_height: u32) -> String {
     )
 }
 
+fn youtube_format_selector(max_upload_bytes: u64, max_height: Option<u32>) -> String {
+    // Reserve ten percent for audio and container overhead. Prefer formats with
+    // a known exact size, then estimated size, before falling back to the old
+    // compatible selector when YouTube does not expose either value.
+    let video_budget = max_upload_bytes.saturating_mul(90) / 100;
+    let height = max_height
+        .map(|height| format!("[height<={height}]"))
+        .unwrap_or_default();
+    let fallback = max_height.map_or_else(
+        || DEFAULT_YT_DLP_FORMAT_SELECTOR.to_string(),
+        video_format_selector,
+    );
+    format!(
+        "bestvideo[ext=mp4][vcodec^=avc1]{height}[filesize<{video_budget}]+bestaudio[ext=m4a]/\
+         bestvideo[ext=mp4][vcodec^=avc1]{height}[filesize_approx<{video_budget}]+bestaudio[ext=m4a]/\
+         best[ext=mp4][vcodec^=avc1]{height}[filesize<{max_upload_bytes}]/\
+         best[ext=mp4][vcodec^=avc1]{height}[filesize_approx<{max_upload_bytes}]/{fallback}"
+    )
+}
+
 async fn prepare_video(
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    max_upload_bytes: u64,
+    limits: DownloadLimits,
 ) -> anyhow::Result<PreparedVideo> {
-    let metadata = probe_video(path).await?;
+    progress.inspecting();
+    let metadata = probe_video(path, cancellation, UTILITY_COMMAND_TIMEOUT).await?;
     let file_size = std::fs::metadata(path)?.len();
     let container_is_mp4 = path
         .extension()
@@ -737,7 +977,7 @@ async fn prepare_video(
         container_is_mp4,
         &metadata.codec,
         file_size,
-        max_upload_bytes,
+        limits.max_upload_bytes,
     ) {
         return Ok(PreparedVideo::original(path));
     }
@@ -745,7 +985,7 @@ async fn prepare_video(
         anyhow::bail!("cancelled");
     }
 
-    progress.processing();
+    progress.transcoding(None);
     let output = generate_random_filename(".mp4");
     let prepared = PreparedVideo::temporary(output);
     let mut command = Command::new("ffmpeg");
@@ -777,8 +1017,8 @@ async fn prepare_video(
         .arg("-ac")
         .arg("2");
 
-    if file_size > max_upload_bytes {
-        let bitrate = target_video_bitrate(max_upload_bytes, metadata.duration_secs)?;
+    if file_size > limits.max_upload_bytes {
+        let bitrate = target_video_bitrate(limits.max_upload_bytes, metadata.duration_secs)?;
         command
             .arg("-b:v")
             .arg(bitrate.to_string())
@@ -790,26 +1030,44 @@ async fn prepare_video(
         command.arg("-crf").arg("23");
     }
     command
+        .arg("-progress")
+        .arg("pipe:1")
+        .arg("-nostats")
         .arg("-movflags")
         .arg("+faststart")
         .arg("-tag:v")
         .arg("avc1")
         .arg(prepared.path());
 
-    match run_command(command, cancellation).await {
+    match run_command(
+        command,
+        cancellation,
+        limits.command_timeout,
+        progress.id(),
+        Some(CommandProgress::Transcode {
+            progress: progress.clone(),
+            duration_micros: metadata.duration_secs.max(0) as u64 * 1_000_000,
+        }),
+    )
+    .await
+    {
         CommandOutcome::Cancelled => anyhow::bail!("cancelled"),
-        CommandOutcome::Finished { success: true, .. } => {}
+        CommandOutcome::TimedOut => anyhow::bail!(
+            "ffmpeg timed out after {} seconds",
+            limits.command_timeout.as_secs()
+        ),
+        CommandOutcome::Finished { success: true, .. } => progress.transcoding(Some(100)),
         CommandOutcome::Finished { stderr, .. } => {
             anyhow::bail!("ffmpeg could not prepare the video: {stderr}")
         }
     }
 
     let output_size = std::fs::metadata(prepared.path())?.len();
-    if output_size > max_upload_bytes {
+    if output_size > limits.max_upload_bytes {
         anyhow::bail!(
             "prepared video is still too large ({} MiB; limit {} MiB)",
             output_size / (1024 * 1024),
-            max_upload_bytes / (1024 * 1024)
+            limits.max_upload_bytes / (1024 * 1024)
         );
     }
     Ok(prepared)
@@ -847,7 +1105,7 @@ async fn send_gallery_albums(
     cancellation: &CancellationToken,
     progress: &JobProgress,
     info: &str,
-    max_upload_bytes: u64,
+    limits: DownloadLimits,
 ) -> DownloadOutcome {
     let media_paths: Vec<&Path> = downloaded
         .iter()
@@ -883,7 +1141,7 @@ async fn send_gallery_albums(
                 path,
                 cancellation,
                 progress,
-                max_upload_bytes,
+                limits,
                 (cursor + offset + 1, total),
             )
             .await;
@@ -918,7 +1176,13 @@ async fn send_gallery_albums(
         let send_result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return DownloadOutcome::Cancelled,
-            result = message.reply_album(batch) => result,
+            _ = tokio::time::sleep(TELEGRAM_OPERATION_TIMEOUT) => {
+                Err(anyhow::anyhow!(
+                    "Telegram album send timed out after {} seconds",
+                    TELEGRAM_OPERATION_TIMEOUT.as_secs()
+                ))
+            },
+            result = message.reply_album(batch) => result.map_err(anyhow::Error::from),
         };
         match send_result {
             Ok(_) => sent += batch_count,
@@ -948,29 +1212,44 @@ async fn prepare_album_media(
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    max_upload_bytes: u64,
+    limits: DownloadLimits,
     position: (usize, usize),
 ) -> anyhow::Result<InputMedia> {
     let (is_video, is_image, _, _) = media_kind(path);
     if is_image {
-        let photo =
-            upload_file_with_progress(client, path, cancellation, progress, position).await?;
+        let photo = upload_file_with_progress(
+            client,
+            path,
+            cancellation,
+            progress,
+            position,
+            limits.upload_timeout,
+        )
+        .await?;
         return Ok(InputMedia::new().photo(photo));
     }
     if !is_video {
         anyhow::bail!("file is not recognized as an image or video");
     }
 
-    let prepared = prepare_video(path, cancellation, progress, max_upload_bytes).await?;
-    let metadata = probe_video(prepared.path()).await?;
-    let thumbnail = extract_thumbnail(prepared.path())
+    let prepared = prepare_video(path, cancellation, progress, limits).await?;
+    progress.inspecting();
+    let metadata = probe_video(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT).await?;
+    progress.thumbnailing();
+    let thumbnail = extract_thumbnail(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT)
         .await
         .ok()
         .map(TempFileGuard::new);
     let result: anyhow::Result<InputMedia> = async {
-        let video =
-            upload_file_with_progress(client, prepared.path(), cancellation, progress, position)
-                .await?;
+        let video = upload_file_with_progress(
+            client,
+            prepared.path(),
+            cancellation,
+            progress,
+            position,
+            limits.upload_timeout,
+        )
+        .await?;
         let mut media = InputMedia::new()
             .document(video)
             .attribute(Attribute::Video {
@@ -981,7 +1260,11 @@ async fn prepare_album_media(
                 h: metadata.height,
             });
         if let Some(thumbnail) = &thumbnail
-            && let Ok(thumb) = client.upload_file(thumbnail.path()).await
+            && let Ok(Ok(thumb)) = tokio::time::timeout(
+                TELEGRAM_OPERATION_TIMEOUT,
+                client.upload_file(thumbnail.path()),
+            )
+            .await
         {
             media = media.thumbnail(thumb);
         }
@@ -998,17 +1281,19 @@ async fn send_video(
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    max_upload_bytes: u64,
+    limits: DownloadLimits,
     delivery: DeliveryPlan,
 ) -> anyhow::Result<()> {
     // Metadata and thumbnail are best-effort: a valid video must still be sent
     // even if probing or thumbnail extraction hiccups. `probe_video` only fails
     // when the file is not a real/decodable video, which we treat as a hard
     // error so we never upload garbage masquerading as media.
-    let prepared = prepare_video(path, cancellation, progress, max_upload_bytes).await?;
-    let metadata = probe_video(prepared.path()).await?;
+    let prepared = prepare_video(path, cancellation, progress, limits).await?;
+    progress.inspecting();
+    let metadata = probe_video(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT).await?;
     progress.uploading(delivery.position.0, delivery.position.1);
-    let thumbnail = extract_thumbnail(prepared.path())
+    progress.thumbnailing();
+    let thumbnail = extract_thumbnail(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT)
         .await
         .ok()
         .map(TempFileGuard::new);
@@ -1020,6 +1305,7 @@ async fn send_video(
             cancellation,
             progress,
             delivery.position,
+            limits.upload_timeout,
         )
         .await?;
         let mut input = InputMessage::new()
@@ -1032,7 +1318,11 @@ async fn send_video(
                 h: metadata.height,
             });
         if let Some(thumbnail) = &thumbnail
-            && let Ok(thumb) = client.upload_file(thumbnail.path()).await
+            && let Ok(Ok(thumb)) = tokio::time::timeout(
+                TELEGRAM_OPERATION_TIMEOUT,
+                client.upload_file(thumbnail.path()),
+            )
+            .await
         {
             input = input.thumbnail(thumb);
         }
@@ -1050,15 +1340,23 @@ async fn send_image(
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    replace_status: bool,
-    position: (usize, usize),
+    limits: DownloadLimits,
+    delivery: DeliveryPlan,
 ) -> anyhow::Result<()> {
-    let photo = upload_file_with_progress(client, path, cancellation, progress, position).await?;
+    let photo = upload_file_with_progress(
+        client,
+        path,
+        cancellation,
+        progress,
+        delivery.position,
+        limits.upload_timeout,
+    )
+    .await?;
     deliver_media(
         message,
         progress,
         InputMessage::new().photo(photo),
-        replace_status,
+        delivery.replace_status,
     )
     .await
 }
@@ -1069,15 +1367,23 @@ async fn send_audio(
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    replace_status: bool,
-    position: (usize, usize),
+    limits: DownloadLimits,
+    delivery: DeliveryPlan,
 ) -> anyhow::Result<()> {
-    let audio = upload_file_with_progress(client, path, cancellation, progress, position).await?;
+    let audio = upload_file_with_progress(
+        client,
+        path,
+        cancellation,
+        progress,
+        delivery.position,
+        limits.upload_timeout,
+    )
+    .await?;
     deliver_media(
         message,
         progress,
         InputMessage::new().document(audio),
-        replace_status,
+        delivery.replace_status,
     )
     .await
 }
@@ -1088,37 +1394,57 @@ async fn deliver_media(
     media: InputMessage,
     replace_status: bool,
 ) -> anyhow::Result<()> {
+    progress.finalizing();
     if !replace_status {
-        source.respond(media).await?;
+        tokio::time::timeout(TELEGRAM_OPERATION_TIMEOUT, source.respond(media))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Telegram media send timed out after {} seconds",
+                    TELEGRAM_OPERATION_TIMEOUT.as_secs()
+                )
+            })??;
         return Ok(());
     }
     match progress.replace_with_media(media.clone()).await {
         Ok(true) => Ok(()),
-        Ok(false) => match source.reply(media).await {
+        Ok(false) => match timed_fallback_send(source, progress, media).await {
             Ok(_) => {
                 progress.delete_status().await;
                 Ok(())
             }
-            Err(send_error) => {
-                progress.resume_text_status();
-                Err(anyhow::anyhow!(
-                    "status was unavailable and fallback media failed: {send_error}"
-                ))
-            }
+            Err(send_error) => Err(anyhow::anyhow!(
+                "status was unavailable and fallback media failed: {send_error}"
+            )),
         },
-        Err(edit_error) => match source.reply(media).await {
+        Err(edit_error) => match timed_fallback_send(source, progress, media).await {
             Ok(_) => {
                 log::warn!("Could not edit status into media; used fallback send: {edit_error}");
                 progress.delete_status().await;
                 Ok(())
             }
-            Err(send_error) => {
-                progress.resume_text_status();
-                Err(anyhow::anyhow!(
-                    "could not edit status ({edit_error}) or send fallback media ({send_error})"
-                ))
-            }
+            Err(send_error) => Err(anyhow::anyhow!(
+                "could not edit status ({edit_error}) or send fallback media ({send_error})"
+            )),
         },
+    }
+}
+
+async fn timed_fallback_send(
+    source: &UpdateMessage,
+    progress: &JobProgress,
+    media: InputMessage,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(TELEGRAM_OPERATION_TIMEOUT, source.reply(media)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => {
+            progress.resume_text_status();
+            Err(error.into())
+        }
+        Err(_) => {
+            progress.resume_text_status();
+            anyhow::bail!("Telegram fallback media send timed out")
+        }
     }
 }
 
@@ -1192,6 +1518,36 @@ mod tests {
     fn quality_selector_caps_every_fallback() {
         let selector = video_format_selector(720);
         assert_eq!(selector.matches("height<=720").count(), 3);
+    }
+
+    #[test]
+    fn youtube_selector_prefers_compatible_media_within_upload_budget() {
+        let selector = youtube_format_selector(1_000_000, Some(720));
+        assert!(selector.contains("[vcodec^=avc1][height<=720][filesize<900000]"));
+        assert!(selector.contains("[filesize_approx<900000]"));
+        assert!(selector.contains("[filesize<1000000]"));
+        assert!(selector.ends_with(&video_format_selector(720)));
+    }
+
+    #[test]
+    fn ffmpeg_progress_is_bounded_and_tolerates_unknown_lines() {
+        assert_eq!(
+            transcode_percent(b"out_time_us=25000000\n", 100_000_000),
+            Some(25)
+        );
+        assert_eq!(
+            transcode_percent(b"out_time_ms=200000000\n", 100_000_000),
+            Some(99)
+        );
+        assert_eq!(transcode_percent(b"progress=continue\n", 100_000_000), None);
+        assert_eq!(transcode_percent(b"out_time_us=1\n", 0), None);
+    }
+
+    #[test]
+    fn yt_dlp_progress_parser_handles_padding_and_bounds() {
+        assert_eq!(download_percent(b"download:  42.7%\n"), Some(42));
+        assert_eq!(download_percent(b"download:101.0%\n"), Some(100));
+        assert_eq!(download_percent(b"[download] destination\n"), None);
     }
 
     #[test]

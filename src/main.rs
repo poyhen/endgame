@@ -21,7 +21,7 @@ use simple_logger::SimpleLogger;
 use tokio::task::JoinSet;
 
 use config::Config;
-use download::DownloadRequest;
+use download::{DownloadLimits, DownloadRequest};
 use queue::DownloadQueue;
 
 const SESSION_FILE: &str = "userbot.session";
@@ -69,11 +69,17 @@ async fn main() -> AnyResult<()> {
 
     println!("Userbot is running...");
 
+    let download_limits = DownloadLimits {
+        max_upload_bytes: (cfg.max_upload_size_mb as u64).saturating_mul(1024 * 1024),
+        command_timeout: Duration::from_secs(cfg.command_timeout_secs as u64),
+        upload_timeout: Duration::from_secs(cfg.upload_timeout_secs as u64),
+        job_timeout: Duration::from_secs(cfg.job_timeout_secs as u64),
+    };
     let download_queue = DownloadQueue::new(
         client.clone(),
         cfg.download_concurrency,
         cfg.download_queue_capacity,
-        cfg.max_upload_size_mb,
+        download_limits,
     );
     let download_queue_handle = download_queue.handle();
     println!(
@@ -161,7 +167,7 @@ async fn main() -> AnyResult<()> {
                 });
             }
             MessageAction::QueueStatus => {
-                let status = download_queue_handle.status_report();
+                let status = download_queue_handle.status_report(uid);
                 spawn_handler(&mut handler_tasks, async move {
                     let _ = message.reply(status).await;
                 });

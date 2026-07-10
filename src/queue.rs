@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use grammers_client::Client;
 use grammers_client::message::{InputMessage, Message as SentMessage};
@@ -9,7 +10,9 @@ use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::cancel::CancellationToken;
-use crate::download::{self, DownloadOutcome, DownloadRequest};
+use crate::download::{self, DownloadLimits, DownloadOutcome, DownloadRequest};
+
+const STATUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct DownloadJob {
     id: u64,
@@ -38,7 +41,7 @@ struct SharedQueue {
     changed: Notify,
     concurrency: usize,
     capacity: usize,
-    max_upload_bytes: u64,
+    limits: DownloadLimits,
     next_id: AtomicU64,
 }
 
@@ -79,18 +82,27 @@ struct JobProgressInner {
     final_media: AtomicBool,
     delete_when_attached: AtomicBool,
     failure: Mutex<Option<String>>,
+    phase_since: Mutex<Instant>,
+    edit_failures: AtomicU8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobPhase {
     Queued,
-    Downloading,
-    Processing,
+    Downloading {
+        percent: Option<u8>,
+    },
+    Inspecting,
+    Transcoding {
+        percent: Option<u8>,
+    },
+    Thumbnailing,
     Uploading {
         current: usize,
         total: usize,
         bytes: Option<(u64, u64)>,
     },
+    Finalizing,
     Cancelling,
     Cancelled,
     Completed,
@@ -114,7 +126,7 @@ impl DownloadQueue {
         client: Client,
         concurrency: usize,
         capacity: usize,
-        max_upload_size_mb: usize,
+        limits: DownloadLimits,
     ) -> Self {
         assert!(concurrency > 0, "download concurrency must be positive");
         assert!(capacity > 0, "download queue capacity must be positive");
@@ -128,7 +140,7 @@ impl DownloadQueue {
             changed: Notify::new(),
             concurrency,
             capacity,
-            max_upload_bytes: (max_upload_size_mb as u64).saturating_mul(1024 * 1024),
+            limits,
             next_id: AtomicU64::new(1),
         });
         let runner_shared = Arc::clone(&shared);
@@ -160,15 +172,32 @@ impl DownloadQueue {
 }
 
 impl DownloadQueueHandle {
-    pub fn status_report(&self) -> String {
+    pub fn status_report(&self, owner_id: i64) -> String {
         let state = lock(&self.shared.state);
-        format!(
-            "Downloads: {}/{} active, {}/{} queued.",
+        let active: Vec<_> = state
+            .active
+            .iter()
+            .filter(|(_, job)| job.owner_id == owner_id)
+            .map(|(_, job)| job.progress.summary())
+            .collect();
+        let queued: Vec<_> = state
+            .pending
+            .iter()
+            .filter(|job| job.owner_id == owner_id)
+            .map(|job| format!("#{} queued", job.id))
+            .collect();
+        let mut lines = vec![format!(
+            "Your downloads: {} active, {} queued. Capacity: {}/{} active, {}/{} waiting.",
+            active.len(),
+            queued.len(),
             state.active.len(),
             self.shared.concurrency,
             state.pending.len(),
             self.shared.capacity
-        )
+        )];
+        lines.extend(active);
+        lines.extend(queued);
+        lines.join("\n")
     }
 
     pub fn try_enqueue(
@@ -287,12 +316,42 @@ impl JobProgress {
                 final_media: AtomicBool::new(false),
                 delete_when_attached: AtomicBool::new(false),
                 failure: Mutex::new(None),
+                phase_since: Mutex::new(Instant::now()),
+                edit_failures: AtomicU8::new(0),
             }),
         }
     }
 
     pub fn downloading(&self) {
-        self.set_phase(JobPhase::Downloading);
+        self.set_phase(JobPhase::Downloading { percent: None });
+    }
+
+    pub fn download_progress(&self, percent: u8) {
+        self.set_phase(JobPhase::Downloading {
+            percent: Some(percent.min(100)),
+        });
+    }
+
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    pub fn inspecting(&self) {
+        self.set_phase(JobPhase::Inspecting);
+    }
+
+    pub fn transcoding(&self, percent: Option<u8>) {
+        self.set_phase(JobPhase::Transcoding {
+            percent: percent.map(|value| value.min(100)),
+        });
+    }
+
+    pub fn thumbnailing(&self) {
+        self.set_phase(JobPhase::Thumbnailing);
+    }
+
+    pub fn finalizing(&self) {
+        self.set_phase(JobPhase::Finalizing);
     }
 
     pub fn uploading(&self, current: usize, total: usize) {
@@ -317,10 +376,6 @@ impl JobProgress {
         });
     }
 
-    pub fn processing(&self) {
-        self.set_phase(JobPhase::Processing);
-    }
-
     pub fn fail(&self, reason: impl Into<String>) {
         let reason = truncate_failure(reason.into());
         *lock(&self.inner.failure) = Some(reason);
@@ -339,8 +394,13 @@ impl JobProgress {
             return Ok(false);
         };
 
-        let _edit_guard = self.inner.edit_lock.lock().await;
-        status.edit(message).await?;
+        let _edit_guard =
+            tokio::time::timeout(STATUS_OPERATION_TIMEOUT, self.inner.edit_lock.lock())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for the status edit lock"))?;
+        tokio::time::timeout(STATUS_OPERATION_TIMEOUT, status.edit(message))
+            .await
+            .map_err(|_| anyhow::anyhow!("final status edit timed out"))??;
         Ok(true)
     }
 
@@ -353,8 +413,30 @@ impl JobProgress {
             return;
         };
 
-        let edit_guard = self.inner.edit_lock.lock().await;
-        let deletion = status.delete().await;
+        let Ok(edit_guard) =
+            tokio::time::timeout(STATUS_OPERATION_TIMEOUT, self.inner.edit_lock.lock()).await
+        else {
+            log::warn!(
+                "Job #{} timed out waiting to delete its status",
+                self.inner.id
+            );
+            self.resume_text_status();
+            return;
+        };
+        let deletion = match tokio::time::timeout(STATUS_OPERATION_TIMEOUT, status.delete()).await {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!("Job #{} status deletion timed out", self.inner.id);
+                self.inner.final_media.store(false, Ordering::Release);
+                self.inner
+                    .delete_when_attached
+                    .store(false, Ordering::Release);
+                drop(edit_guard);
+                self.set_phase(JobPhase::Completed);
+                self.schedule_flush();
+                return;
+            }
+        };
         if deletion.is_ok() {
             *lock(&self.inner.status) = None;
             return;
@@ -380,15 +462,39 @@ impl JobProgress {
 
     async fn attach(&self) {
         let initial = self.render();
-        match self.inner.source.reply(initial.clone()).await {
-            Ok(status) => {
+        match tokio::time::timeout(
+            STATUS_OPERATION_TIMEOUT,
+            self.inner.source.reply(initial.clone()),
+        )
+        .await
+        {
+            Err(_) => {
+                self.inner.attachment_done.store(true, Ordering::Release);
+                self.inner.status_ready.notify_waiters();
+                log::warn!("Job #{} status creation timed out", self.inner.id);
+            }
+            Ok(Ok(status)) => {
                 *lock(&self.inner.status) = Some(status.clone());
                 *lock(&self.inner.last_render) = Some(initial);
                 self.inner.attachment_done.store(true, Ordering::Release);
                 self.inner.status_ready.notify_waiters();
                 if self.inner.delete_when_attached.load(Ordering::Acquire) {
-                    let edit_guard = self.inner.edit_lock.lock().await;
-                    let deletion = status.delete().await;
+                    let Ok(edit_guard) =
+                        tokio::time::timeout(STATUS_OPERATION_TIMEOUT, self.inner.edit_lock.lock())
+                            .await
+                    else {
+                        self.resume_text_status();
+                        return;
+                    };
+                    let deletion =
+                        match tokio::time::timeout(STATUS_OPERATION_TIMEOUT, status.delete()).await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                self.resume_text_status();
+                                return;
+                            }
+                        };
                     if deletion.is_ok() {
                         *lock(&self.inner.status) = None;
                     } else {
@@ -404,7 +510,7 @@ impl JobProgress {
                     self.schedule_flush();
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.inner.attachment_done.store(true, Ordering::Release);
                 self.inner.status_ready.notify_waiters();
                 log::warn!("Failed to create job status message: {error}");
@@ -441,16 +547,28 @@ impl JobProgress {
     }
 
     fn set_phase(&self, new_phase: JobPhase) {
-        let changed = {
+        let old_phase = {
             let mut phase = lock(&self.inner.phase);
             if !phase.can_transition_to(&new_phase) {
-                false
+                None
             } else {
+                let old = phase.clone();
                 *phase = new_phase;
-                true
+                Some(old)
             }
         };
-        if changed {
+        if let Some(old_phase) = old_phase {
+            let new_label = lock(&self.inner.phase).label();
+            if old_phase.label() != new_label {
+                *lock(&self.inner.phase_since) = Instant::now();
+                self.inner.edit_failures.store(0, Ordering::Release);
+                log::info!(
+                    "Job #{} phase {} -> {}",
+                    self.inner.id,
+                    old_phase.label(),
+                    new_label
+                );
+            }
             self.schedule_flush();
         }
     }
@@ -469,7 +587,18 @@ impl JobProgress {
 
     async fn flush(self) {
         loop {
-            let _edit_guard = self.inner.edit_lock.lock().await;
+            let Ok(_edit_guard) =
+                tokio::time::timeout(STATUS_OPERATION_TIMEOUT, self.inner.edit_lock.lock()).await
+            else {
+                log::warn!("Job #{} status edit lock timed out", self.inner.id);
+                let retry = self.inner.edit_failures.fetch_add(1, Ordering::AcqRel) < 2;
+                self.inner.flushing.store(false, Ordering::Release);
+                if retry {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    self.schedule_flush();
+                }
+                break;
+            };
             if self.inner.final_media.load(Ordering::Acquire) {
                 self.inner.flushing.store(false, Ordering::Release);
                 break;
@@ -477,16 +606,35 @@ impl JobProgress {
             let desired = self.render();
             let status = lock(&self.inner.status).clone();
             let last_render = lock(&self.inner.last_render).clone();
+            let mut retry = false;
             if last_render.as_deref() != Some(&desired)
                 && let Some(status) = status
             {
-                let edit = status.edit(desired.clone()).await;
-                if edit.is_ok() {
-                    *lock(&self.inner.last_render) = Some(desired.clone());
+                match tokio::time::timeout(STATUS_OPERATION_TIMEOUT, status.edit(desired.clone()))
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        *lock(&self.inner.last_render) = Some(desired.clone());
+                        self.inner.edit_failures.store(0, Ordering::Release);
+                    }
+                    Ok(Err(error)) => {
+                        log::warn!("Job #{} status edit failed: {error}", self.inner.id);
+                        retry = self.inner.edit_failures.fetch_add(1, Ordering::AcqRel) < 2;
+                    }
+                    Err(_) => {
+                        log::warn!("Job #{} status edit timed out", self.inner.id);
+                        retry = self.inner.edit_failures.fetch_add(1, Ordering::AcqRel) < 2;
+                    }
                 }
             }
 
             self.inner.flushing.store(false, Ordering::Release);
+            if retry {
+                drop(_edit_guard);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                self.schedule_flush();
+                break;
+            }
             if self.render() == desired || self.inner.flushing.swap(true, Ordering::AcqRel) {
                 break;
             }
@@ -497,15 +645,33 @@ impl JobProgress {
         let phase = lock(&self.inner.phase).clone();
         match phase {
             JobPhase::Queued => format!("Job #{} queued.", self.inner.id),
-            JobPhase::Downloading => format!("Job #{} is downloading.", self.inner.id),
-            JobPhase::Processing => {
-                format!("Job #{} is preparing compatible media.", self.inner.id)
+            JobPhase::Downloading {
+                percent: Some(percent),
+            } => format!("Job #{} is downloading: {percent}%.", self.inner.id),
+            JobPhase::Downloading { percent: None } => {
+                format!("Job #{} is downloading.", self.inner.id)
+            }
+            JobPhase::Inspecting => format!("Job #{} is inspecting media.", self.inner.id),
+            JobPhase::Transcoding {
+                percent: Some(percent),
+            } => {
+                format!(
+                    "Job #{} is transcoding compatible media: {percent}%.",
+                    self.inner.id
+                )
+            }
+            JobPhase::Transcoding { percent: None } => {
+                format!("Job #{} is transcoding compatible media.", self.inner.id)
+            }
+            JobPhase::Thumbnailing => {
+                format!("Job #{} is preparing a thumbnail.", self.inner.id)
             }
             JobPhase::Uploading {
                 current,
                 total,
                 bytes,
             } => render_uploading(self.inner.id, current, total, bytes),
+            JobPhase::Finalizing => format!("Job #{} is finalizing delivery.", self.inner.id),
             JobPhase::Cancelling => format!("Job #{} is cancelling…", self.inner.id),
             JobPhase::Cancelled => format!("Job #{} was cancelled.", self.inner.id),
             JobPhase::Completed => match lock(&self.inner.failure).as_deref() {
@@ -517,6 +683,17 @@ impl JobProgress {
                 None => format!("Job #{} failed.", self.inner.id),
             },
         }
+    }
+
+    fn summary(&self) -> String {
+        let phase = lock(&self.inner.phase).clone();
+        let elapsed = lock(&self.inner.phase_since).elapsed();
+        format!(
+            "#{} {} for {}",
+            self.inner.id,
+            phase.label(),
+            format_duration(elapsed)
+        )
     }
 }
 
@@ -536,9 +713,42 @@ impl JobPhase {
             (self, next),
             (
                 Self::Cancelling,
-                Self::Queued | Self::Downloading | Self::Uploading { .. } | Self::Processing
+                Self::Queued
+                    | Self::Downloading { .. }
+                    | Self::Inspecting
+                    | Self::Transcoding { .. }
+                    | Self::Thumbnailing
+                    | Self::Uploading { .. }
+                    | Self::Finalizing
             )
         )
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Downloading { .. } => "downloading",
+            Self::Inspecting => "inspecting media",
+            Self::Transcoding { .. } => "transcoding",
+            Self::Thumbnailing => "preparing thumbnail",
+            Self::Uploading { .. } => "uploading",
+            Self::Finalizing => "finalizing",
+            Self::Cancelling => "cancelling",
+            Self::Cancelled => "cancelled",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 
@@ -607,27 +817,55 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
             };
             let client = client.clone();
             let job_shared = Arc::clone(&shared);
-            let max_upload_bytes = shared.max_upload_bytes;
+            let limits = shared.limits;
             tasks.spawn(async move {
                 let _active_guard = ActiveJobGuard {
                     id: job.id,
                     shared: job_shared,
                 };
-                job.progress.downloading();
-                let outcome = if job.cancellation.is_cancelled() {
-                    DownloadOutcome::Cancelled
-                } else {
-                    download::download_and_upload(
-                        client,
-                        job.message,
-                        job.request,
-                        &job.cancellation,
-                        &job.progress,
-                        max_upload_bytes,
-                    )
-                    .await
+                let result_progress = job.progress.clone();
+                let cancellation = job.cancellation.clone();
+                let watchdog_cancellation = job.cancellation.clone();
+                let worker_progress = job.progress.clone();
+                let mut worker = tokio::spawn(async move {
+                    worker_progress.downloading();
+                    if cancellation.is_cancelled() {
+                        DownloadOutcome::Cancelled
+                    } else {
+                        download::download_and_upload(
+                            client,
+                            job.message,
+                            job.request,
+                            &cancellation,
+                            &worker_progress,
+                            limits,
+                        )
+                        .await
+                    }
+                });
+                let outcome = match tokio::time::timeout(limits.job_timeout, &mut worker).await {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(error)) => {
+                        result_progress.fail(format!("job task crashed: {error}"));
+                        DownloadOutcome::Failed
+                    }
+                    Err(_) => {
+                        watchdog_cancellation.cancel();
+                        if tokio::time::timeout(Duration::from_secs(5), &mut worker)
+                            .await
+                            .is_err()
+                        {
+                            worker.abort();
+                            let _ = worker.await;
+                        }
+                        result_progress.fail(format!(
+                            "job timed out after {} seconds",
+                            limits.job_timeout.as_secs()
+                        ));
+                        DownloadOutcome::Failed
+                    }
                 };
-                (job.progress, outcome)
+                (result_progress, outcome)
             });
         }
 
@@ -650,7 +888,9 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
                         };
                         progress.set_phase(phase);
                     }
-                    Some(Err(error)) => log::warn!("Download task ended unexpectedly: {error}"),
+                    Some(Err(error)) => log::error!(
+                        "Download queue wrapper ended unexpectedly; this is a queue bug: {error}"
+                    ),
                     None => {}
                 }
             }
@@ -675,12 +915,14 @@ fn truncate_failure(reason: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobPhase, format_bytes, render_uploading, truncate_failure};
+    use std::time::Duration;
+
+    use super::{JobPhase, format_bytes, format_duration, render_uploading, truncate_failure};
 
     #[test]
     fn only_final_phases_are_terminal() {
         assert!(!JobPhase::Queued.is_terminal());
-        assert!(!JobPhase::Downloading.is_terminal());
+        assert!(!(JobPhase::Downloading { percent: None }).is_terminal());
         assert!(!JobPhase::Cancelling.is_terminal());
         assert!(JobPhase::Cancelled.is_terminal());
         assert!(JobPhase::Completed.is_terminal());
@@ -689,8 +931,13 @@ mod tests {
 
     #[test]
     fn cancelling_cannot_regress_to_active_progress() {
-        assert!(!JobPhase::Cancelling.can_transition_to(&JobPhase::Downloading));
-        assert!(!JobPhase::Cancelling.can_transition_to(&JobPhase::Processing));
+        assert!(
+            !JobPhase::Cancelling.can_transition_to(&JobPhase::Downloading { percent: Some(50) })
+        );
+        assert!(!JobPhase::Cancelling.can_transition_to(&JobPhase::Inspecting));
+        assert!(
+            !JobPhase::Cancelling.can_transition_to(&JobPhase::Transcoding { percent: Some(50) })
+        );
         assert!(
             !JobPhase::Cancelling.can_transition_to(&JobPhase::Uploading {
                 current: 1,
@@ -727,5 +974,12 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1024), "1.00 KiB");
         assert_eq!(format_bytes(512 * 1024 * 1024), "512 MiB");
+    }
+
+    #[test]
+    fn elapsed_phase_time_is_human_readable() {
+        assert_eq!(format_duration(Duration::from_secs(8)), "8s");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(format_duration(Duration::from_secs(7_500)), "2h 5m");
     }
 }
