@@ -86,7 +86,11 @@ pub enum JobPhase {
     Queued,
     Downloading,
     Processing,
-    Uploading { current: usize, total: usize },
+    Uploading {
+        current: usize,
+        total: usize,
+        bytes: Option<(u64, u64)>,
+    },
     Cancelling,
     Cancelled,
     Completed,
@@ -292,7 +296,25 @@ impl JobProgress {
     }
 
     pub fn uploading(&self, current: usize, total: usize) {
-        self.set_phase(JobPhase::Uploading { current, total });
+        self.set_phase(JobPhase::Uploading {
+            current,
+            total,
+            bytes: None,
+        });
+    }
+
+    pub fn upload_progress(
+        &self,
+        current: usize,
+        total: usize,
+        uploaded_bytes: u64,
+        total_bytes: u64,
+    ) {
+        self.set_phase(JobPhase::Uploading {
+            current,
+            total,
+            bytes: Some((uploaded_bytes.min(total_bytes), total_bytes)),
+        });
     }
 
     pub fn processing(&self) {
@@ -479,10 +501,11 @@ impl JobProgress {
             JobPhase::Processing => {
                 format!("Job #{} is preparing compatible media.", self.inner.id)
             }
-            JobPhase::Uploading { current, total } => format!(
-                "Job #{} is uploading item {current}/{total}.",
-                self.inner.id
-            ),
+            JobPhase::Uploading {
+                current,
+                total,
+                bytes,
+            } => render_uploading(self.inner.id, current, total, bytes),
             JobPhase::Cancelling => format!("Job #{} is cancelling…", self.inner.id),
             JobPhase::Cancelled => format!("Job #{} was cancelled.", self.inner.id),
             JobPhase::Completed => match lock(&self.inner.failure).as_deref() {
@@ -517,6 +540,45 @@ impl JobPhase {
             )
         )
     }
+}
+
+fn render_uploading(id: u64, current: usize, total: usize, bytes: Option<(u64, u64)>) -> String {
+    let Some((uploaded, size)) = bytes else {
+        return format!("Job #{id} is uploading item {current}/{total}.");
+    };
+    let percentage = if size == 0 {
+        100
+    } else {
+        ((uploaded as u128 * 100) / size as u128) as u64
+    };
+    let remaining = size.saturating_sub(uploaded);
+    format!(
+        "Job #{id} is uploading item {current}/{total}: {percentage}% • {} left.",
+        format_bytes(remaining)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let precision = if value >= 100.0 {
+        0
+    } else if value >= 10.0 {
+        1
+    } else {
+        2
+    };
+    format!("{value:.precision$} {}", UNITS[unit])
 }
 
 async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
@@ -613,7 +675,7 @@ fn truncate_failure(reason: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobPhase, truncate_failure};
+    use super::{JobPhase, format_bytes, render_uploading, truncate_failure};
 
     #[test]
     fn only_final_phases_are_terminal() {
@@ -633,6 +695,7 @@ mod tests {
             !JobPhase::Cancelling.can_transition_to(&JobPhase::Uploading {
                 current: 1,
                 total: 2,
+                bytes: None,
             })
         );
         assert!(JobPhase::Cancelling.can_transition_to(&JobPhase::Cancelled));
@@ -645,5 +708,24 @@ mod tests {
         let truncated = truncate_failure(reason);
         assert_eq!(truncated.chars().count(), 500);
         assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn upload_status_reports_percentage_and_remaining_bytes() {
+        assert_eq!(
+            render_uploading(15, 1, 1, Some((800, 2_000))),
+            "Job #15 is uploading item 1/1: 40% • 1.17 KiB left."
+        );
+        assert_eq!(
+            render_uploading(15, 1, 1, None),
+            "Job #15 is uploading item 1/1."
+        );
+    }
+
+    #[test]
+    fn byte_count_formatting_uses_readable_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(512 * 1024 * 1024), "512 MiB");
     }
 }

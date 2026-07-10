@@ -53,6 +53,9 @@ Both queue settings and the upload limit must be positive integers.
 Each accepted job maintains one status message as it moves through queued,
 downloading, media preparation, uploading, and a terminal state. Cancellation
 is owner-scoped: users cannot cancel or inspect another user's jobs.
+While primary media is uploading, the status includes the current item's
+percentage and estimated bytes remaining. Progress edits are throttled to avoid
+excessive Telegram requests; thumbnail uploads are not included.
 
 For a single image, video, or audio result, that status message is edited into
 the final media message instead of sending a second message. For galleries, the

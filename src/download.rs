@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use grammers_client::Client;
-use grammers_client::media::{Attribute, InputMedia};
+use grammers_client::media::{Attribute, InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
 use grammers_client::update::Message as UpdateMessage;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::process::Command;
 
 use crate::cancel::CancellationToken;
@@ -19,6 +21,8 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/201001
 
 const DEFAULT_YT_DLP_FORMAT_SELECTOR: &str =
     "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
+
+const UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownloadRequest {
@@ -64,6 +68,77 @@ enum CommandOutcome {
 }
 
 struct TempFileGuard(PathBuf);
+
+struct ProgressReader<R> {
+    inner: R,
+    progress: JobProgress,
+    position: (usize, usize),
+    bytes_read: u64,
+    total_bytes: u64,
+    last_reported_bytes: u64,
+    last_report: Instant,
+}
+
+impl<R> ProgressReader<R> {
+    fn new(inner: R, progress: JobProgress, position: (usize, usize), total_bytes: u64) -> Self {
+        progress.upload_progress(position.0, position.1, 0, total_bytes);
+        Self {
+            inner,
+            progress,
+            position,
+            bytes_read: 0,
+            total_bytes,
+            last_reported_bytes: 0,
+            last_report: Instant::now(),
+        }
+    }
+
+    fn record_read(&mut self, bytes: usize) {
+        self.bytes_read = self
+            .bytes_read
+            .saturating_add(bytes as u64)
+            .min(self.total_bytes);
+        if self.bytes_read > self.last_reported_bytes
+            && self.last_report.elapsed() >= UPLOAD_PROGRESS_INTERVAL
+        {
+            let reported_bytes = in_flight_upload_bytes(self.bytes_read, self.total_bytes);
+            self.progress.upload_progress(
+                self.position.0,
+                self.position.1,
+                reported_bytes,
+                self.total_bytes,
+            );
+            self.last_reported_bytes = self.bytes_read;
+            self.last_report = Instant::now();
+        }
+    }
+}
+
+fn in_flight_upload_bytes(bytes_read: u64, total_bytes: u64) -> u64 {
+    let bytes_read = bytes_read.min(total_bytes);
+    // Grammers can read a few chunks ahead of Telegram's acknowledgements, so
+    // reserve 100% for the successful return from `upload_stream`.
+    if bytes_read == total_bytes && total_bytes > 0 {
+        total_bytes - 1
+    } else {
+        bytes_read
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+        if let Poll::Ready(Ok(())) = &result {
+            self.record_read(buffer.filled().len().saturating_sub(filled_before));
+        }
+        result
+    }
+}
 
 impl TempFileGuard {
     fn new(path: String) -> Self {
@@ -263,6 +338,32 @@ fn media_kind(path: &Path) -> (bool, bool, bool, Option<String>) {
         ),
         None => (false, false, false, None),
     }
+}
+
+async fn upload_file_with_progress(
+    client: &Client,
+    path: &Path,
+    cancellation: &CancellationToken,
+    progress: &JobProgress,
+    position: (usize, usize),
+) -> anyhow::Result<Uploaded> {
+    let file = tokio::fs::File::open(path).await?;
+    let total_bytes = file.metadata().await?.len();
+    let size = usize::try_from(total_bytes)
+        .map_err(|_| anyhow::anyhow!("file is too large for this platform"))?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("upload path has no file name"))?;
+    let mut reader = ProgressReader::new(file, progress.clone(), position, total_bytes);
+
+    let uploaded = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
+        result = client.upload_stream(&mut reader, size, name) => result?,
+    };
+    progress.upload_progress(position.0, position.1, total_bytes, total_bytes);
+    Ok(uploaded)
 }
 
 pub async fn download_and_upload(
@@ -510,6 +611,7 @@ pub async fn download_and_upload(
                 cancellation,
                 progress,
                 replace_status_with_media,
+                (index + 1, downloaded.len()),
             )
             .await;
             if cancellation.is_cancelled() {
@@ -539,6 +641,7 @@ pub async fn download_and_upload(
                 cancellation,
                 progress,
                 replace_status_with_media,
+                (index + 1, downloaded.len()),
             )
             .await;
             if cancellation.is_cancelled() {
@@ -775,8 +878,15 @@ async fn send_gallery_albums(
             }
             progress.uploading(cursor + offset + 1, total);
 
-            let prepared =
-                prepare_album_media(client, path, cancellation, progress, max_upload_bytes).await;
+            let prepared = prepare_album_media(
+                client,
+                path,
+                cancellation,
+                progress,
+                max_upload_bytes,
+                (cursor + offset + 1, total),
+            )
+            .await;
             if cancellation.is_cancelled() {
                 return DownloadOutcome::Cancelled;
             }
@@ -839,14 +949,12 @@ async fn prepare_album_media(
     cancellation: &CancellationToken,
     progress: &JobProgress,
     max_upload_bytes: u64,
+    position: (usize, usize),
 ) -> anyhow::Result<InputMedia> {
     let (is_video, is_image, _, _) = media_kind(path);
     if is_image {
-        let photo = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
-            result = client.upload_file(path) => result?,
-        };
+        let photo =
+            upload_file_with_progress(client, path, cancellation, progress, position).await?;
         return Ok(InputMedia::new().photo(photo));
     }
     if !is_video {
@@ -860,11 +968,9 @@ async fn prepare_album_media(
         .ok()
         .map(TempFileGuard::new);
     let result: anyhow::Result<InputMedia> = async {
-        let video = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
-            result = client.upload_file(prepared.path()) => result?,
-        };
+        let video =
+            upload_file_with_progress(client, prepared.path(), cancellation, progress, position)
+                .await?;
         let mut media = InputMedia::new()
             .document(video)
             .attribute(Attribute::Video {
@@ -908,11 +1014,14 @@ async fn send_video(
         .map(TempFileGuard::new);
 
     let result: anyhow::Result<()> = async {
-        let video = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
-            result = client.upload_file(prepared.path()) => result?,
-        };
+        let video = upload_file_with_progress(
+            client,
+            prepared.path(),
+            cancellation,
+            progress,
+            delivery.position,
+        )
+        .await?;
         let mut input = InputMessage::new()
             .document(video)
             .attribute(Attribute::Video {
@@ -942,12 +1051,9 @@ async fn send_image(
     cancellation: &CancellationToken,
     progress: &JobProgress,
     replace_status: bool,
+    position: (usize, usize),
 ) -> anyhow::Result<()> {
-    let photo = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
-        result = client.upload_file(path) => result?,
-    };
+    let photo = upload_file_with_progress(client, path, cancellation, progress, position).await?;
     deliver_media(
         message,
         progress,
@@ -964,12 +1070,9 @@ async fn send_audio(
     cancellation: &CancellationToken,
     progress: &JobProgress,
     replace_status: bool,
+    position: (usize, usize),
 ) -> anyhow::Result<()> {
-    let audio = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
-        result = client.upload_file(path) => result?,
-    };
+    let audio = upload_file_with_progress(client, path, cancellation, progress, position).await?;
     deliver_media(
         message,
         progress,
@@ -1096,5 +1199,12 @@ mod tests {
         let (_, _, is_audio, mime) = media_kind(Path::new("track.mp3"));
         assert!(is_audio);
         assert_eq!(mime.as_deref(), Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn in_flight_progress_never_claims_completion() {
+        assert_eq!(in_flight_upload_bytes(500, 1_000), 500);
+        assert_eq!(in_flight_upload_bytes(1_000, 1_000), 999);
+        assert_eq!(in_flight_upload_bytes(2_000, 1_000), 999);
     }
 }
