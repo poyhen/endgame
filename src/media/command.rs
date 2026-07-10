@@ -37,6 +37,10 @@ where
         .into_owned();
     command
         .kill_on_drop(true)
+        // All managed tools are non-interactive. Inheriting a controlling TTY
+        // while placing the child in its own process group can make ffmpeg stop
+        // itself with SIGTTIN when it probes stdin for interactive commands.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -205,6 +209,24 @@ mod tests {
                 ref stdout,
                 ..
             } if stdout == "success"
+        ));
+    }
+
+    #[tokio::test]
+    async fn closes_stdin_for_noninteractive_children() {
+        let outcome = run_test(
+            shell("if read line; then exit 9; else printf closed; fi"),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Finished {
+                success: true,
+                ref stdout,
+                ..
+            } if stdout == "closed"
         ));
     }
 
