@@ -92,3 +92,16 @@ Telegram connection closes.
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Code layout
+
+- `main.rs` is the composition root and live-update dispatcher.
+- `commands.rs`, `cookies.rs`, and `telegram/auth.rs` isolate Telegram-facing input concerns.
+- `jobs/queue.rs` schedules work, `jobs/progress.rs` coordinates progress state, and
+  `jobs/status.rs` renders user-facing status text.
+- `media/pipeline.rs` orchestrates jobs. Subprocesses, downloader policy, delivery,
+  inspection, progress parsing, transcoding, request types, and temporary workspaces
+  live in separate modules under `media/`.
+
+Every job downloads and generates derived media inside a unique temporary workspace.
+The workspace is explicitly removed asynchronously when the job finishes.

@@ -1,68 +1,14 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use grammers_client::Client;
 use grammers_client::message::{InputMessage, Message as SentMessage};
 use grammers_client::update::Message as UpdateMessage;
 use tokio::sync::Notify;
-use tokio::task::{JoinHandle, JoinSet};
 
-use crate::cancel::CancellationToken;
-use crate::download::{self, DownloadLimits, DownloadOutcome, DownloadRequest};
+use crate::jobs::status;
 
 const STATUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
-
-struct DownloadJob {
-    id: u64,
-    owner_id: i64,
-    message: UpdateMessage,
-    request: DownloadRequest,
-    cancellation: CancellationToken,
-    progress: JobProgress,
-}
-
-#[derive(Clone)]
-struct ActiveJob {
-    owner_id: i64,
-    cancellation: CancellationToken,
-    progress: JobProgress,
-}
-
-struct QueueState {
-    accepting: bool,
-    pending: VecDeque<DownloadJob>,
-    active: HashMap<u64, ActiveJob>,
-}
-
-struct SharedQueue {
-    state: Mutex<QueueState>,
-    changed: Notify,
-    concurrency: usize,
-    capacity: usize,
-    limits: DownloadLimits,
-    next_id: AtomicU64,
-}
-
-#[derive(Clone)]
-pub struct DownloadQueueHandle {
-    shared: Arc<SharedQueue>,
-}
-
-pub struct DownloadQueue {
-    handle: DownloadQueueHandle,
-    runner: JoinHandle<()>,
-}
-
-pub enum QueueReply {
-    Accepted(JobProgress),
-    Silent,
-    Message {
-        message: Box<UpdateMessage>,
-        text: String,
-    },
-}
 
 #[derive(Clone)]
 pub struct JobProgress {
@@ -109,199 +55,8 @@ pub enum JobPhase {
     Failed,
 }
 
-struct ActiveJobGuard {
-    id: u64,
-    shared: Arc<SharedQueue>,
-}
-
-impl Drop for ActiveJobGuard {
-    fn drop(&mut self) {
-        lock(&self.shared.state).active.remove(&self.id);
-        self.shared.changed.notify_one();
-    }
-}
-
-impl DownloadQueue {
-    pub fn new(
-        client: Client,
-        concurrency: usize,
-        capacity: usize,
-        limits: DownloadLimits,
-    ) -> Self {
-        assert!(concurrency > 0, "download concurrency must be positive");
-        assert!(capacity > 0, "download queue capacity must be positive");
-
-        let shared = Arc::new(SharedQueue {
-            state: Mutex::new(QueueState {
-                accepting: true,
-                pending: VecDeque::with_capacity(capacity),
-                active: HashMap::with_capacity(concurrency),
-            }),
-            changed: Notify::new(),
-            concurrency,
-            capacity,
-            limits,
-            next_id: AtomicU64::new(1),
-        });
-        let runner_shared = Arc::clone(&shared);
-        let runner = tokio::spawn(run_queue(runner_shared, client));
-
-        Self {
-            handle: DownloadQueueHandle { shared },
-            runner,
-        }
-    }
-
-    pub fn handle(&self) -> DownloadQueueHandle {
-        self.handle.clone()
-    }
-
-    pub async fn shutdown(self) {
-        let Self { handle, runner } = self;
-        {
-            let mut state = lock(&handle.shared.state);
-            state.accepting = false;
-        }
-        handle.shared.changed.notify_one();
-        drop(handle);
-
-        if let Err(error) = runner.await {
-            log::warn!("Download queue ended unexpectedly: {error}");
-        }
-    }
-}
-
-impl DownloadQueueHandle {
-    pub fn status_report(&self, owner_id: i64) -> String {
-        let state = lock(&self.shared.state);
-        let active: Vec<_> = state
-            .active
-            .iter()
-            .filter(|(_, job)| job.owner_id == owner_id)
-            .map(|(_, job)| job.progress.summary())
-            .collect();
-        let queued: Vec<_> = state
-            .pending
-            .iter()
-            .filter(|job| job.owner_id == owner_id)
-            .map(|job| format!("#{} queued", job.id))
-            .collect();
-        let mut lines = vec![format!(
-            "Your downloads: {} active, {} queued. Capacity: {}/{} active, {}/{} waiting.",
-            active.len(),
-            queued.len(),
-            state.active.len(),
-            self.shared.concurrency,
-            state.pending.len(),
-            self.shared.capacity
-        )];
-        lines.extend(active);
-        lines.extend(queued);
-        lines.join("\n")
-    }
-
-    pub fn try_enqueue(
-        &self,
-        message: UpdateMessage,
-        owner_id: i64,
-        request: DownloadRequest,
-    ) -> QueueReply {
-        let mut state = lock(&self.shared.state);
-        if !state.accepting {
-            return QueueReply::message(
-                message,
-                "The downloader is shutting down. Please try again after it restarts.",
-            );
-        }
-        if state.pending.len() >= self.shared.capacity {
-            return QueueReply::message(
-                message,
-                format!(
-                    "The download queue is full ({} waiting, {}/{} active). Please try again later.",
-                    state.pending.len(),
-                    state.active.len(),
-                    self.shared.concurrency
-                ),
-            );
-        }
-
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let cancellation = CancellationToken::new();
-        let progress = JobProgress::new(id, message.clone());
-        state.pending.push_back(DownloadJob {
-            id,
-            owner_id,
-            message,
-            request,
-            cancellation,
-            progress: progress.clone(),
-        });
-        drop(state);
-        self.shared.changed.notify_one();
-
-        QueueReply::Accepted(progress)
-    }
-
-    pub fn try_cancel(&self, message: UpdateMessage, owner_id: i64, id: u64) -> QueueReply {
-        let mut state = lock(&self.shared.state);
-
-        if let Some(position) = state
-            .pending
-            .iter()
-            .position(|job| job.id == id && job.owner_id == owner_id)
-        {
-            let job = state.pending.remove(position).expect("position must exist");
-            job.cancellation.cancel();
-            job.progress.set_phase(JobPhase::Cancelled);
-            drop(state);
-            self.shared.changed.notify_one();
-            return QueueReply::Silent;
-        }
-
-        if let Some(job) = state
-            .active
-            .get(&id)
-            .filter(|job| job.owner_id == owner_id)
-            .cloned()
-        {
-            job.cancellation.cancel();
-            job.progress.set_phase(JobPhase::Cancelling);
-            drop(state);
-            return QueueReply::Silent;
-        }
-
-        QueueReply::message(
-            message,
-            format!("No cancellable job #{id} was found for your account."),
-        )
-    }
-}
-
-impl QueueReply {
-    pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Accepted(_))
-    }
-
-    fn message(message: UpdateMessage, text: impl Into<String>) -> Self {
-        Self::Message {
-            message: Box::new(message),
-            text: text.into(),
-        }
-    }
-
-    pub async fn send(self) {
-        match self {
-            Self::Accepted(progress) => progress.attach().await,
-            Self::Silent => {}
-            Self::Message { message, text } => {
-                let _ = message.reply(text).await;
-            }
-        }
-    }
-}
-
 impl JobProgress {
-    fn new(id: u64, source: UpdateMessage) -> Self {
+    pub(crate) fn new(id: u64, source: UpdateMessage) -> Self {
         Self {
             inner: Arc::new(JobProgressInner {
                 id,
@@ -460,7 +215,7 @@ impl JobProgress {
         self.schedule_flush();
     }
 
-    async fn attach(&self) {
+    pub(crate) async fn attach(&self) {
         let initial = self.render();
         match tokio::time::timeout(
             STATUS_OPERATION_TIMEOUT,
@@ -546,7 +301,7 @@ impl JobProgress {
             .flatten()
     }
 
-    fn set_phase(&self, new_phase: JobPhase) {
+    pub(crate) fn set_phase(&self, new_phase: JobPhase) {
         let old_phase = {
             let mut phase = lock(&self.inner.phase);
             if !phase.can_transition_to(&new_phase) {
@@ -643,56 +398,18 @@ impl JobProgress {
 
     fn render(&self) -> String {
         let phase = lock(&self.inner.phase).clone();
-        match phase {
-            JobPhase::Queued => format!("Job #{} queued.", self.inner.id),
-            JobPhase::Downloading {
-                percent: Some(percent),
-            } => format!("Job #{} is downloading: {percent}%.", self.inner.id),
-            JobPhase::Downloading { percent: None } => {
-                format!("Job #{} is downloading.", self.inner.id)
-            }
-            JobPhase::Inspecting => format!("Job #{} is inspecting media.", self.inner.id),
-            JobPhase::Transcoding {
-                percent: Some(percent),
-            } => {
-                format!(
-                    "Job #{} is transcoding compatible media: {percent}%.",
-                    self.inner.id
-                )
-            }
-            JobPhase::Transcoding { percent: None } => {
-                format!("Job #{} is transcoding compatible media.", self.inner.id)
-            }
-            JobPhase::Thumbnailing => {
-                format!("Job #{} is preparing a thumbnail.", self.inner.id)
-            }
-            JobPhase::Uploading {
-                current,
-                total,
-                bytes,
-            } => render_uploading(self.inner.id, current, total, bytes),
-            JobPhase::Finalizing => format!("Job #{} is finalizing delivery.", self.inner.id),
-            JobPhase::Cancelling => format!("Job #{} is cancelling…", self.inner.id),
-            JobPhase::Cancelled => format!("Job #{} was cancelled.", self.inner.id),
-            JobPhase::Completed => match lock(&self.inner.failure).as_deref() {
-                Some(reason) => format!("Job #{} completed with warnings: {reason}", self.inner.id),
-                None => format!("Job #{} completed.", self.inner.id),
-            },
-            JobPhase::Failed => match lock(&self.inner.failure).as_deref() {
-                Some(reason) => format!("Job #{} failed: {reason}", self.inner.id),
-                None => format!("Job #{} failed.", self.inner.id),
-            },
-        }
+        let failure = lock(&self.inner.failure).clone();
+        status::render(self.inner.id, &phase, failure.as_deref())
     }
 
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         let phase = lock(&self.inner.phase).clone();
         let elapsed = lock(&self.inner.phase_since).elapsed();
         format!(
             "#{} {} for {}",
             self.inner.id,
             phase.label(),
-            format_duration(elapsed)
+            status::format_duration(elapsed)
         )
     }
 }
@@ -741,161 +458,11 @@ impl JobPhase {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
+fn truncate_failure(reason: String) -> String {
+    if reason.chars().count() > 500 {
+        format!("{}...", reason.chars().take(497).collect::<String>())
     } else {
-        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
-    }
-}
-
-fn render_uploading(id: u64, current: usize, total: usize, bytes: Option<(u64, u64)>) -> String {
-    let Some((uploaded, size)) = bytes else {
-        return format!("Job #{id} is uploading item {current}/{total}.");
-    };
-    let percentage = if size == 0 {
-        100
-    } else {
-        ((uploaded as u128 * 100) / size as u128) as u64
-    };
-    let remaining = size.saturating_sub(uploaded);
-    format!(
-        "Job #{id} is uploading item {current}/{total}: {percentage}% • {} left.",
-        format_bytes(remaining)
-    )
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-
-    let mut value = bytes as f64;
-    let mut unit = 0usize;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    let precision = if value >= 100.0 {
-        0
-    } else if value >= 10.0 {
-        1
-    } else {
-        2
-    };
-    format!("{value:.precision$} {}", UNITS[unit])
-}
-
-async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
-    let mut tasks = JoinSet::new();
-
-    loop {
-        while tasks.len() < shared.concurrency {
-            let job = {
-                let mut state = lock(&shared.state);
-                let job = state.pending.pop_front();
-                if let Some(job) = &job {
-                    state.active.insert(
-                        job.id,
-                        ActiveJob {
-                            owner_id: job.owner_id,
-                            cancellation: job.cancellation.clone(),
-                            progress: job.progress.clone(),
-                        },
-                    );
-                }
-                job
-            };
-
-            let Some(job) = job else {
-                break;
-            };
-            let client = client.clone();
-            let job_shared = Arc::clone(&shared);
-            let limits = shared.limits;
-            tasks.spawn(async move {
-                let _active_guard = ActiveJobGuard {
-                    id: job.id,
-                    shared: job_shared,
-                };
-                let result_progress = job.progress.clone();
-                let cancellation = job.cancellation.clone();
-                let watchdog_cancellation = job.cancellation.clone();
-                let worker_progress = job.progress.clone();
-                let mut worker = tokio::spawn(async move {
-                    worker_progress.downloading();
-                    if cancellation.is_cancelled() {
-                        DownloadOutcome::Cancelled
-                    } else {
-                        download::download_and_upload(
-                            client,
-                            job.message,
-                            job.request,
-                            &cancellation,
-                            &worker_progress,
-                            limits,
-                        )
-                        .await
-                    }
-                });
-                let outcome = match tokio::time::timeout(limits.job_timeout, &mut worker).await {
-                    Ok(Ok(outcome)) => outcome,
-                    Ok(Err(error)) => {
-                        result_progress.fail(format!("job task crashed: {error}"));
-                        DownloadOutcome::Failed
-                    }
-                    Err(_) => {
-                        watchdog_cancellation.cancel();
-                        if tokio::time::timeout(Duration::from_secs(5), &mut worker)
-                            .await
-                            .is_err()
-                        {
-                            worker.abort();
-                            let _ = worker.await;
-                        }
-                        result_progress.fail(format!(
-                            "job timed out after {} seconds",
-                            limits.job_timeout.as_secs()
-                        ));
-                        DownloadOutcome::Failed
-                    }
-                };
-                (result_progress, outcome)
-            });
-        }
-
-        let should_exit = {
-            let state = lock(&shared.state);
-            !state.accepting && state.pending.is_empty() && state.active.is_empty()
-        };
-        if should_exit && tasks.is_empty() {
-            break;
-        }
-
-        tokio::select! {
-            result = tasks.join_next(), if !tasks.is_empty() => {
-                match result {
-                    Some(Ok((progress, outcome))) => {
-                        let phase = match outcome {
-                            DownloadOutcome::Completed => JobPhase::Completed,
-                            DownloadOutcome::Failed => JobPhase::Failed,
-                            DownloadOutcome::Cancelled => JobPhase::Cancelled,
-                        };
-                        progress.set_phase(phase);
-                    }
-                    Some(Err(error)) => log::error!(
-                        "Download queue wrapper ended unexpectedly; this is a queue bug: {error}"
-                    ),
-                    None => {}
-                }
-            }
-            _ = shared.changed.notified() => {}
-        }
+        reason
     }
 }
 
@@ -905,19 +472,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn truncate_failure(reason: String) -> String {
-    if reason.chars().count() > 500 {
-        format!("{}...", reason.chars().take(497).collect::<String>())
-    } else {
-        reason
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::{JobPhase, format_bytes, format_duration, render_uploading, truncate_failure};
+    use super::{JobPhase, truncate_failure};
 
     #[test]
     fn only_final_phases_are_terminal() {
@@ -955,31 +512,5 @@ mod tests {
         let truncated = truncate_failure(reason);
         assert_eq!(truncated.chars().count(), 500);
         assert!(truncated.ends_with("..."));
-    }
-
-    #[test]
-    fn upload_status_reports_percentage_and_remaining_bytes() {
-        assert_eq!(
-            render_uploading(15, 1, 1, Some((800, 2_000))),
-            "Job #15 is uploading item 1/1: 40% • 1.17 KiB left."
-        );
-        assert_eq!(
-            render_uploading(15, 1, 1, None),
-            "Job #15 is uploading item 1/1."
-        );
-    }
-
-    #[test]
-    fn byte_count_formatting_uses_readable_binary_units() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(1024), "1.00 KiB");
-        assert_eq!(format_bytes(512 * 1024 * 1024), "512 MiB");
-    }
-
-    #[test]
-    fn elapsed_phase_time_is_human_readable() {
-        assert_eq!(format_duration(Duration::from_secs(8)), "8s");
-        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
-        assert_eq!(format_duration(Duration::from_secs(7_500)), "2h 5m");
     }
 }

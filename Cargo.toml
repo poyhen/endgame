@@ -4,9 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-grammers-client = { git = "https://codeberg.org/Lonami/grammers.git" }
-grammers-session = { git = "https://codeberg.org/Lonami/grammers.git", features = ["sqlite-storage"] }
-tokio = { version = "1", features = ["full"] }
+grammers-client = { git = "https://codeberg.org/Lonami/grammers.git", rev = "bafe16b9d9e8940f5a0d94c7466171b6c754144e" }
+grammers-session = { git = "https://codeberg.org/Lonami/grammers.git", rev = "bafe16b9d9e8940f5a0d94c7466171b6c754144e", features = ["sqlite-storage"] }
+tokio = { version = "1", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 log = "0.4"
 simple_logger = { version = "5", default-features = false, features = ["colors"] }
 rand = "0.8"
