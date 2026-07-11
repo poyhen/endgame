@@ -15,6 +15,7 @@ __pycache__
 .glimpse
 gallery_dl_downloads
 instacookies.txt
+allowed-users.txt
 userbot.session
 userbot.session-journal
 userbot.session-wal

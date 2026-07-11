@@ -1,9 +1,11 @@
 use regex::Regex;
+use std::path::PathBuf;
 
 pub struct Config {
     pub api_id: i32,
     pub api_hash: String,
     pub allowed_user_ids: Vec<i64>,
+    pub allowed_users_file: PathBuf,
     pub super_users: Vec<i64>,
     pub url_pattern: Regex,
     pub download_concurrency: usize,
@@ -61,6 +63,10 @@ impl Config {
 
         let super_users = parse_id_list(&std::env::var("SUPERUSERS").unwrap_or_default())
             .map_err(|e| anyhow::anyhow!("SUPERUSERS: {e}"))?;
+        let allowed_users_file = std::env::var_os("ALLOWED_USERS_FILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("allowed-users.txt"));
 
         // NOTE: `$-_` is an ASCII range (0x24..=0x5F) that includes `/`, `:`, `?`, `=`, etc.
         // This mirrors the original Python regex `[$-_@.&+]` exactly (the `-` is NOT escaped).
@@ -95,6 +101,7 @@ impl Config {
             api_id,
             api_hash,
             allowed_user_ids,
+            allowed_users_file,
             super_users,
             url_pattern,
             download_concurrency,

@@ -5,6 +5,7 @@ mod cookies;
 mod jobs;
 mod media;
 mod telegram;
+mod users;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use commands::{MessageAction, classify_message};
 use config::Config;
 use jobs::DownloadQueue;
 use media::request::DownloadLimits;
+use telegram::allowed_users::AllowedUsers;
 
 const SESSION_FILE: &str = "userbot.session";
 const MAX_HANDLER_TASKS: usize = 64;
@@ -71,6 +73,10 @@ async fn main() -> AnyResult<()> {
     );
 
     let super_users = Arc::new(cfg.super_users.clone());
+    let allowed_users = Arc::new(AllowedUsers::load(
+        cfg.allowed_user_ids.iter().copied(),
+        &cfg.allowed_users_file,
+    )?);
     let url_pattern: Regex = cfg.url_pattern;
 
     // Don't replay updates that arrived while we were offline. Those would be
@@ -130,7 +136,7 @@ async fn main() -> AnyResult<()> {
         let Some(uid) = peer_id.bare_id() else {
             continue;
         };
-        if !cfg.allowed_user_ids.contains(&uid) {
+        if !super_users.contains(&uid) && !allowed_users.contains(uid) {
             log::info!("Ignoring unauthorized user {uid}");
             continue;
         }
@@ -138,6 +144,13 @@ async fn main() -> AnyResult<()> {
         log::info!("Dispatching message from user {uid}");
         let text = message.text().to_string();
         match classify_message(&text, &url_pattern) {
+            MessageAction::AddUser(user_id) => {
+                let supers = Arc::clone(&super_users);
+                let users = Arc::clone(&allowed_users);
+                spawn_handler(&mut handler_tasks, async move {
+                    users::handle_add(message, uid, user_id, supers, users).await;
+                });
+            }
             MessageAction::InstagramCookies => {
                 let supers = Arc::clone(&super_users);
                 spawn_handler(&mut handler_tasks, async move {

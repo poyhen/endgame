@@ -3,6 +3,7 @@ use regex::Regex;
 use crate::media::request::DownloadRequest;
 
 pub enum MessageAction {
+    AddUser(Option<i64>),
     InstagramCookies,
     HealthCheck,
     QueueStatus,
@@ -14,11 +15,17 @@ pub enum MessageAction {
 
 pub fn classify_message(text: &str, url_pattern: &Regex) -> MessageAction {
     match command_name(text) {
+        Some(name) if name == "add" => MessageAction::AddUser(
+            text.split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse().ok())
+                .filter(|user_id| *user_id > 0),
+        ),
         Some(name) if name == "insta" => MessageAction::InstagramCookies,
         Some(name) if name == "h" || name == "ping" => MessageAction::HealthCheck,
         Some(name) if name == "status" || name == "queue" => MessageAction::QueueStatus,
         Some(name) if name == "help" => MessageAction::Reply(
-            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /cancel <job-id>, /status, or /ping.",
+            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /cancel <job-id>, /status, or /ping. Superusers can use /add <user-id>.",
         ),
         Some(name) if name == "cancel" => MessageAction::Cancel(
             text.split_whitespace()
@@ -97,6 +104,26 @@ mod tests {
         assert!(matches!(
             classify_message("/cancel nope", &pattern()),
             MessageAction::Cancel(None)
+        ));
+    }
+
+    #[test]
+    fn parses_add_command_and_rejects_invalid_ids() {
+        assert!(matches!(
+            classify_message("/add 42", &pattern()),
+            MessageAction::AddUser(Some(42))
+        ));
+        assert!(matches!(
+            classify_message("/add@endgame 7", &pattern()),
+            MessageAction::AddUser(Some(7))
+        ));
+        assert!(matches!(
+            classify_message("/add nope", &pattern()),
+            MessageAction::AddUser(None)
+        ));
+        assert!(matches!(
+            classify_message("/add -1", &pattern()),
+            MessageAction::AddUser(None)
         ));
     }
 

@@ -26,7 +26,8 @@ The bot reads configuration from environment variables.
 | `API_ID` | Yes | — | Telegram API ID |
 | `API_HASH` | Yes | — | Telegram API hash |
 | `ALLOWED_USER_IDS` | Yes | — | Comma-separated Telegram user IDs |
-| `SUPERUSERS` | No | Empty | Users allowed to update Instagram cookies |
+| `ALLOWED_USERS_FILE` | No | `allowed-users.txt` | File used to persist users added at runtime |
+| `SUPERUSERS` | No | Empty | Implicitly authorized users allowed to run administrative commands |
 | `DOWNLOAD_CONCURRENCY` | No | `2` | Maximum simultaneous download jobs |
 | `DOWNLOAD_QUEUE_CAPACITY` | No | `20` | Maximum jobs waiting in the queue |
 | `MAX_UPLOAD_SIZE_MB` | No | `1900` | Video size ceiling before adaptive transcoding |
@@ -49,6 +50,9 @@ Queue settings, the upload limit, and timeout values must be positive integers.
 - Use `/status` or `/queue` for current queue usage, `/ping` to check whether
   the userbot is alive, and `/help` for the command summary (`/h` remains an
   alias for `/ping`).
+- Superusers are implicitly authorized and can use `/add <user-id>` to authorize
+  another user. Runtime additions are combined with `ALLOWED_USER_IDS` at startup
+  and persisted in `ALLOWED_USERS_FILE`.
 - Superusers can use `/insta <cookie-content>` to replace Instagram cookies.
   The cookie message is deleted and the local file is written with owner-only
   permissions on Unix systems.
