@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -262,7 +262,11 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
         while tasks.len() < shared.concurrency {
             let job = {
                 let mut state = lock(&shared.state);
-                let job = state.pending.pop_front();
+                let position = next_pending_position(
+                    state.pending.iter().map(|job| job.owner_id),
+                    state.active.values().map(|job| job.owner_id),
+                );
+                let job = position.and_then(|position| state.pending.remove(position));
                 if let Some(job) = &job {
                     state.active.insert(
                         job.id,
@@ -367,4 +371,47 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn next_pending_position(
+    pending_owners: impl IntoIterator<Item = i64>,
+    active_owners: impl IntoIterator<Item = i64>,
+) -> Option<usize> {
+    let active: HashSet<_> = active_owners.into_iter().collect();
+    let mut has_pending = false;
+
+    for (position, owner_id) in pending_owners.into_iter().enumerate() {
+        has_pending = true;
+        if !active.contains(&owner_id) {
+            return Some(position);
+        }
+    }
+
+    has_pending.then_some(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_pending_position;
+
+    #[test]
+    fn prefers_a_user_without_an_active_job() {
+        assert_eq!(next_pending_position([11, 11, 22], [11]), Some(2));
+    }
+
+    #[test]
+    fn preserves_fifo_among_users_without_active_jobs() {
+        assert_eq!(next_pending_position([11, 22, 33], [11]), Some(1));
+    }
+
+    #[test]
+    fn keeps_workers_busy_when_every_pending_user_is_active() {
+        assert_eq!(next_pending_position([11, 22, 11], [11, 22]), Some(0));
+        assert_eq!(next_pending_position([11, 11], [11]), Some(0));
+    }
+
+    #[test]
+    fn returns_none_for_an_empty_queue() {
+        assert_eq!(next_pending_position([], [11]), None);
+    }
 }
