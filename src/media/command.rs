@@ -89,14 +89,19 @@ where
     let interrupted = !matches!(reason, StopReason::Finished);
     let stdout = collect(stdout_task, interrupted).await;
     let stderr = collect(stderr_task, interrupted).await;
+    let result = match &reason {
+        StopReason::Finished => match &status {
+            Ok(status) if status.success() => "succeeded".to_string(),
+            Ok(status) => format!("failed: {status}"),
+            Err(error) => format!("failed to wait for process: {error}"),
+        },
+        StopReason::Cancelled => "cancelled".to_string(),
+        StopReason::TimedOut => "timed out".to_string(),
+    };
     log::info!(
         "{operation} {program} ended after {:.1}s ({})",
         started.elapsed().as_secs_f64(),
-        match reason {
-            StopReason::Finished => "finished",
-            StopReason::Cancelled => "cancelled",
-            StopReason::TimedOut => "timed out",
-        }
+        result
     );
 
     match reason {

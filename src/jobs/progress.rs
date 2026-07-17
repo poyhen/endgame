@@ -109,14 +109,6 @@ impl JobProgress {
         self.set_phase(JobPhase::Finalizing);
     }
 
-    pub fn uploading(&self, current: usize, total: usize) {
-        self.set_phase(JobPhase::Uploading {
-            current,
-            total,
-            bytes: None,
-        });
-    }
-
     pub fn upload_progress(
         &self,
         current: usize,

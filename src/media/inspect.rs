@@ -18,6 +18,7 @@ pub async fn extract_thumbnail(
     video_file: &Path,
     cancellation: &CancellationToken,
     timeout: Duration,
+    operation: &str,
 ) -> anyhow::Result<PathBuf> {
     let parent = video_file.parent().unwrap_or_else(|| Path::new("."));
     let thumbnail = random_file_in(parent, ".jpg");
@@ -33,7 +34,7 @@ pub async fn extract_thumbnail(
         .arg("-vf")
         .arg("scale=320:-1")
         .arg(&thumbnail);
-    let (success, _, stderr) = run(command, cancellation, timeout).await?;
+    let (success, _, stderr) = run(command, cancellation, timeout, operation).await?;
     if !success {
         let _ = tokio::fs::remove_file(&thumbnail).await;
         anyhow::bail!("failed to extract thumbnail: {stderr}");
@@ -48,6 +49,7 @@ pub async fn probe_video(
     video_file: &Path,
     cancellation: &CancellationToken,
     timeout: Duration,
+    operation: &str,
 ) -> anyhow::Result<VideoMetadata> {
     let mut command = Command::new("ffprobe");
     command
@@ -60,7 +62,7 @@ pub async fn probe_video(
         .arg("-of")
         .arg("default=noprint_wrappers=1")
         .arg(video_file);
-    let (success, stdout, stderr) = run(command, cancellation, timeout).await?;
+    let (success, stdout, stderr) = run(command, cancellation, timeout, operation).await?;
     if !success {
         anyhow::bail!("ffprobe could not read video: {stderr}");
     }
@@ -89,12 +91,13 @@ async fn run(
     command_to_run: Command,
     cancellation: &CancellationToken,
     timeout: Duration,
+    operation: &str,
 ) -> anyhow::Result<(bool, String, String)> {
     match command::run(
         command_to_run,
         cancellation,
         timeout,
-        "Media utility",
+        operation,
         |mut stdout| async move { command::read_bounded(&mut stdout).await },
     )
     .await

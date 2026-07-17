@@ -52,7 +52,7 @@ async fn main() -> AnyResult<()> {
 
     telegram::auth::ensure_authorized(&client, &cfg.api_hash).await?;
 
-    println!("Userbot is running...");
+    log::info!("Userbot is running");
 
     let download_limits = DownloadLimits {
         max_upload_bytes: (cfg.max_upload_size_mb as u64).saturating_mul(1024 * 1024),
@@ -67,9 +67,10 @@ async fn main() -> AnyResult<()> {
         download_limits,
     );
     let download_queue_handle = download_queue.handle();
-    println!(
+    log::info!(
         "Download queue ready ({} active, {} waiting).",
-        cfg.download_concurrency, cfg.download_queue_capacity
+        cfg.download_concurrency,
+        cfg.download_queue_capacity
     );
 
     let super_users = Arc::new(cfg.super_users.clone());
@@ -204,13 +205,13 @@ async fn main() -> AnyResult<()> {
     // accepted downloads before disconnecting their Telegram client.
     drop(download_queue_handle);
     while handler_tasks.join_next().await.is_some() {}
-    println!("Draining download queue...");
+    log::info!("Draining download queue");
     download_queue.shutdown().await;
 
-    println!("Saving session file...");
+    log::info!("Saving session file");
     let _ = updates.sync_update_state().await;
 
-    println!("Gracefully closing connection...");
+    log::info!("Gracefully closing connection");
     handle.quit();
 
     Ok(())

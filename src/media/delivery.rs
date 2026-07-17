@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::cancel::CancellationToken;
 use crate::jobs::JobProgress;
-use crate::media::inspect::{extract_thumbnail, probe_video};
+use crate::media::inspect::extract_thumbnail;
 use crate::media::request::{DownloadLimits, DownloadOutcome};
 use crate::media::transcode::prepare_video;
 
@@ -174,7 +174,6 @@ pub(crate) async fn send_gallery_albums(
             if cancellation.is_cancelled() {
                 return DownloadOutcome::Cancelled;
             }
-            progress.uploading(cursor + offset + 1, total);
 
             let prepared = prepare_album_media(
                 client,
@@ -190,7 +189,6 @@ pub(crate) async fn send_gallery_albums(
             }
             match prepared {
                 Ok(media) => {
-                    progress.uploading(cursor + offset + 1, total);
                     batch.push(media);
                 }
                 Err(error) => {
@@ -213,6 +211,7 @@ pub(crate) async fn send_gallery_albums(
             continue;
         }
         let batch_count = batch.len();
+        progress.finalizing();
         let send_result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return DownloadOutcome::Cancelled,
@@ -234,7 +233,7 @@ pub(crate) async fn send_gallery_albums(
     }
 
     if sent > 0 {
-        println!("{info} | Finished processing gallery. Sent {sent}/{total} item(s) in albums.");
+        log::info!("{info} | Finished processing gallery. Sent {sent}/{total} item(s) in albums.");
         if let Some(error) = last_error {
             progress.complete_with_warning(error);
         } else {
@@ -273,12 +272,17 @@ async fn prepare_album_media(
     }
 
     let prepared = prepare_video(path, cancellation, progress, limits).await?;
-    progress.inspecting();
-    let metadata = probe_video(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT).await?;
+    let metadata = prepared.metadata();
     progress.thumbnailing();
-    let thumbnail = extract_thumbnail(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT)
-        .await
-        .ok();
+    let operation = format!("Job #{}", progress.id());
+    let thumbnail = extract_thumbnail(
+        prepared.path(),
+        cancellation,
+        UTILITY_COMMAND_TIMEOUT,
+        &operation,
+    )
+    .await
+    .ok();
     let result: anyhow::Result<InputMedia> = async {
         let video = upload_file_with_progress(
             client,
@@ -321,18 +325,20 @@ pub(crate) async fn send_video(
     limits: DownloadLimits,
     delivery: DeliveryPlan,
 ) -> anyhow::Result<()> {
-    // Metadata and thumbnail are best-effort: a valid video must still be sent
-    // even if probing or thumbnail extraction hiccups. `probe_video` only fails
-    // when the file is not a real/decodable video, which we treat as a hard
-    // error so we never upload garbage masquerading as media.
+    // Thumbnail extraction is best-effort. Metadata probing remains a hard
+    // requirement so we never upload garbage masquerading as video.
     let prepared = prepare_video(path, cancellation, progress, limits).await?;
-    progress.inspecting();
-    let metadata = probe_video(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT).await?;
-    progress.uploading(delivery.position.0, delivery.position.1);
+    let metadata = prepared.metadata();
     progress.thumbnailing();
-    let thumbnail = extract_thumbnail(prepared.path(), cancellation, UTILITY_COMMAND_TIMEOUT)
-        .await
-        .ok();
+    let operation = format!("Job #{}", progress.id());
+    let thumbnail = extract_thumbnail(
+        prepared.path(),
+        cancellation,
+        UTILITY_COMMAND_TIMEOUT,
+        &operation,
+    )
+    .await
+    .ok();
 
     let result: anyhow::Result<()> = async {
         let video = upload_file_with_progress(

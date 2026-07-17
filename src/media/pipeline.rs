@@ -21,16 +21,19 @@ enum CommandProgress {
 }
 
 fn user_info(message: &UpdateMessage) -> String {
-    let peer = message.sender().or_else(|| message.peer());
-    let Some(peer) = peer else {
-        return "User".to_string();
-    };
-    let Some(id) = peer.id().bare_id() else {
-        return "User".to_string();
-    };
-    match peer.username() {
-        Some(u) => format!("User @{u} ({id})"),
-        None => format!("User {id}"),
+    let username = message
+        .sender()
+        .or_else(|| message.peer())
+        .and_then(|peer| peer.username().map(str::to_owned));
+    format_user_info(username.as_deref(), message.peer_id().bare_id())
+}
+
+fn format_user_info(username: Option<&str>, id: Option<i64>) -> String {
+    match (username, id) {
+        (Some(username), Some(id)) => format!("User @{username} ({id})"),
+        (Some(username), None) => format!("User @{username}"),
+        (None, Some(id)) => format!("User {id}"),
+        (None, None) => "User (unknown)".to_string(),
     }
 }
 
@@ -134,7 +137,7 @@ async fn download_and_upload_in_workspace(
         return DownloadOutcome::Cancelled;
     }
 
-    let info = user_info(&message);
+    let info = format!("Job #{} | {}", progress.id(), user_info(&message));
     let DownloadRequest { url, mode } = request;
     let cookie_file = if url.contains("instagram.com/")
         && tokio::fs::try_exists("instacookies.txt")
@@ -248,7 +251,6 @@ async fn download_and_upload_in_workspace(
         if cancellation.is_cancelled() {
             return DownloadOutcome::Cancelled;
         }
-        progress.uploading(index + 1, downloaded.len());
 
         if !tokio::fs::try_exists(item).await.unwrap_or(false) {
             if !use_yt_dlp {
@@ -291,7 +293,7 @@ async fn download_and_upload_in_workspace(
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    println!("{info} | Error processing video {name}: {e}");
+                    log::warn!("{info} | Error processing video {name}: {e}");
                     last_error = Some(format!("could not process video {name}: {e}"));
                 }
             }
@@ -323,7 +325,7 @@ async fn download_and_upload_in_workspace(
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    println!("{info} | Error sending image {name}: {e}");
+                    log::warn!("{info} | Error sending image {name}: {e}");
                     last_error = Some(format!("could not upload image {name}: {e}"));
                 }
             }
@@ -376,7 +378,7 @@ async fn download_and_upload_in_workspace(
     }
 
     if !any_success && !downloaded.is_empty() {
-        println!(
+        log::warn!(
             "{info} | {downloader_name} downloaded content, but could not process or send any recognized media file."
         );
         progress.fail(
@@ -387,9 +389,9 @@ async fn download_and_upload_in_workspace(
     } else if !use_yt_dlp && sent_count > 0 {
         let total = downloaded.len();
         if sent_count == total {
-            println!("{info} | Finished processing gallery. Sent all {sent_count} item(s).");
+            log::info!("{info} | Finished processing gallery. Sent all {sent_count} item(s).");
         } else {
-            println!(
+            log::info!(
                 "{info} | Finished processing gallery. Sent {sent_count} item(s) from {total} downloaded file(s)."
             );
         }
@@ -407,5 +409,20 @@ async fn download_and_upload_in_workspace(
         DownloadOutcome::Completed
     } else {
         DownloadOutcome::Failed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_user_info;
+
+    #[test]
+    fn user_info_keeps_the_peer_id_when_entity_details_are_missing() {
+        assert_eq!(
+            format_user_info(Some("notfurkan"), Some(126_344_924)),
+            "User @notfurkan (126344924)"
+        );
+        assert_eq!(format_user_info(None, Some(126_344_924)), "User 126344924");
+        assert_eq!(format_user_info(None, None), "User (unknown)");
     }
 }

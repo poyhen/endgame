@@ -6,7 +6,7 @@ use tokio::process::Command;
 use crate::cancel::CancellationToken;
 use crate::jobs::JobProgress;
 use crate::media::command::{self, CommandOutcome};
-use crate::media::inspect::probe_video;
+use crate::media::inspect::{VideoMetadata, probe_video};
 use crate::media::progress::read_transcode;
 use crate::media::request::DownloadLimits;
 use crate::media::workspace::random_file_in;
@@ -15,21 +15,27 @@ const UTILITY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct PreparedVideo {
     path: PathBuf,
+    metadata: VideoMetadata,
 }
 
 impl PreparedVideo {
-    fn original(path: &Path) -> Self {
+    fn original(path: &Path, metadata: VideoMetadata) -> Self {
         Self {
             path: path.to_path_buf(),
+            metadata,
         }
     }
 
-    fn temporary(path: PathBuf) -> Self {
-        Self { path }
+    fn temporary(path: PathBuf, metadata: VideoMetadata) -> Self {
+        Self { path, metadata }
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn metadata(&self) -> &VideoMetadata {
+        &self.metadata
     }
 }
 
@@ -39,8 +45,9 @@ pub(crate) async fn prepare_video(
     progress: &JobProgress,
     limits: DownloadLimits,
 ) -> anyhow::Result<PreparedVideo> {
+    let operation = format!("Job #{}", progress.id());
     progress.inspecting();
-    let metadata = probe_video(path, cancellation, UTILITY_COMMAND_TIMEOUT).await?;
+    let metadata = probe_video(path, cancellation, UTILITY_COMMAND_TIMEOUT, &operation).await?;
     let file_size = tokio::fs::metadata(path).await?.len();
     let container_is_mp4 = path
         .extension()
@@ -52,7 +59,7 @@ pub(crate) async fn prepare_video(
         file_size,
         limits.max_upload_bytes,
     ) {
-        return Ok(PreparedVideo::original(path));
+        return Ok(PreparedVideo::original(path, metadata));
     }
     if cancellation.is_cancelled() {
         anyhow::bail!("cancelled");
@@ -60,7 +67,6 @@ pub(crate) async fn prepare_video(
 
     progress.transcoding(None);
     let output = random_file_in(path.parent().unwrap_or_else(|| Path::new(".")), ".mp4");
-    let prepared = PreparedVideo::temporary(output);
     let mut command = Command::new("ffmpeg");
     command
         .arg("-y")
@@ -110,9 +116,8 @@ pub(crate) async fn prepare_video(
         .arg("+faststart")
         .arg("-tag:v")
         .arg("avc1")
-        .arg(prepared.path());
+        .arg(&output);
 
-    let operation = format!("Job #{}", progress.id());
     match command::run(command, cancellation, limits.command_timeout, &operation, {
         let progress = progress.clone();
         let duration_micros = metadata.duration_secs.max(0) as u64 * 1_000_000;
@@ -131,7 +136,7 @@ pub(crate) async fn prepare_video(
         }
     }
 
-    let output_size = tokio::fs::metadata(prepared.path()).await?.len();
+    let output_size = tokio::fs::metadata(&output).await?.len();
     if output_size > limits.max_upload_bytes {
         anyhow::bail!(
             "prepared video is still too large ({} MiB; limit {} MiB)",
@@ -139,7 +144,9 @@ pub(crate) async fn prepare_video(
             limits.max_upload_bytes / (1024 * 1024)
         );
     }
-    Ok(prepared)
+    progress.inspecting();
+    let metadata = probe_video(&output, cancellation, UTILITY_COMMAND_TIMEOUT, &operation).await?;
+    Ok(PreparedVideo::temporary(output, metadata))
 }
 
 fn requires_video_transcode(
