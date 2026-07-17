@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use grammers_client::Client;
@@ -20,12 +22,71 @@ enum CommandProgress {
     Download(JobProgress),
 }
 
-fn user_info(message: &UpdateMessage) -> String {
-    let username = message
+const USER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+static USERNAME_CACHE: OnceLock<Mutex<HashMap<i64, Option<String>>>> = OnceLock::new();
+
+async fn user_info(client: &Client, message: &UpdateMessage) -> String {
+    let id = message.peer_id().bare_id();
+    let embedded_username = message
         .sender()
         .or_else(|| message.peer())
         .and_then(|peer| peer.username().map(str::to_owned));
-    format_user_info(username.as_deref(), message.peer_id().bare_id())
+    if let (Some(id), Some(username)) = (id, embedded_username.as_ref()) {
+        username_cache().insert(id, Some(username.clone()));
+    }
+
+    let username = match (embedded_username, id) {
+        (Some(username), _) => Some(username),
+        (None, Some(id)) => resolve_username(client, message, id).await,
+        (None, None) => None,
+    };
+    format_user_info(username.as_deref(), id)
+}
+
+async fn resolve_username(client: &Client, message: &UpdateMessage, id: i64) -> Option<String> {
+    if let Some(username) = username_cache().get(&id).cloned() {
+        return username;
+    }
+
+    let lookup = async {
+        let Some(sender) = message
+            .sender_ref()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        else {
+            anyhow::bail!("sender reference is unavailable");
+        };
+        let peer = client.resolve_peer(sender).await?;
+        Ok::<_, anyhow::Error>(peer.username().map(str::to_owned).or_else(|| {
+            peer.usernames()
+                .first()
+                .map(|username| (*username).to_owned())
+        }))
+    };
+    match tokio::time::timeout(USER_LOOKUP_TIMEOUT, lookup).await {
+        Ok(Ok(username)) => {
+            username_cache().insert(id, username.clone());
+            username
+        }
+        Ok(Err(error)) => {
+            log::warn!("Could not resolve username for user {id}: {error}");
+            None
+        }
+        Err(_) => {
+            log::warn!(
+                "Timed out resolving username for user {id} after {} seconds",
+                USER_LOOKUP_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
+}
+
+fn username_cache() -> MutexGuard<'static, HashMap<i64, Option<String>>> {
+    USERNAME_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn format_user_info(username: Option<&str>, id: Option<i64>) -> String {
@@ -137,7 +198,11 @@ async fn download_and_upload_in_workspace(
         return DownloadOutcome::Cancelled;
     }
 
-    let info = format!("Job #{} | {}", progress.id(), user_info(&message));
+    let info = format!(
+        "Job #{} | {}",
+        progress.id(),
+        user_info(&client, &message).await
+    );
     let DownloadRequest { url, mode } = request;
     let cookie_file = if url.contains("instagram.com/")
         && tokio::fs::try_exists("instacookies.txt")
