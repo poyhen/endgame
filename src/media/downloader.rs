@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::process::Command;
 
@@ -21,7 +22,8 @@ pub fn build(
     workspace: &Path,
     limits: DownloadLimits,
 ) -> DownloadCommand {
-    let use_yt_dlp = matches!(mode, DownloadMode::Audio) || should_use_yt_dlp(url);
+    let use_yt_dlp =
+        matches!(mode, DownloadMode::Audio | DownloadMode::Clip(_)) || should_use_yt_dlp(url);
     let program = if use_yt_dlp { "yt-dlp" } else { "gallery-dl" };
     let mut command = Command::new(program);
 
@@ -46,6 +48,20 @@ pub fn build(
                     .arg("--audio-quality")
                     .arg("0");
             }
+            DownloadMode::Clip(range) => {
+                // Full-source filesize estimates would unnecessarily downgrade a short
+                // clip from a long video. Enforce the upload limit on the finished clip.
+                command
+                    .arg("-f")
+                    .arg(unrestricted_video_format(url))
+                    .arg("--download-sections")
+                    .arg(format!(
+                        "*{}-{}",
+                        format_clip_timestamp(range.start()),
+                        format_clip_timestamp(range.end())
+                    ))
+                    .arg("--force-keyframes-at-cuts");
+            }
             DownloadMode::Video { max_height }
                 if url.contains("youtube.com/") || url.contains("youtu.be/") =>
             {
@@ -60,12 +76,7 @@ pub fn build(
                 command.arg("-f").arg(video_format_selector(*height));
             }
             DownloadMode::Video { max_height: None } => {
-                let format = if url.contains("tiktok.com") {
-                    "bestvideo[ext=mp4][vcodec=h264]+bestaudio[ext=m4a]/best[ext=mp4][vcodec=h264]/best"
-                } else {
-                    DEFAULT_FORMAT
-                };
-                command.arg("-f").arg(format);
+                command.arg("-f").arg(unrestricted_video_format(url));
             }
         }
         command.arg("--no-playlist").arg(url);
@@ -84,6 +95,34 @@ pub fn build(
         program,
         reports_progress: use_yt_dlp,
     }
+}
+
+fn unrestricted_video_format(url: &str) -> &'static str {
+    if url.contains("tiktok.com") {
+        "bestvideo[ext=mp4][vcodec=h264]+bestaudio[ext=m4a]/best[ext=mp4][vcodec=h264]/best"
+    } else {
+        DEFAULT_FORMAT
+    }
+}
+
+fn format_clip_timestamp(timestamp: Duration) -> String {
+    let total_milliseconds = timestamp.as_millis();
+    let milliseconds = total_milliseconds % 1_000;
+    let total_seconds = total_milliseconds / 1_000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+
+    let mut formatted = if hours == 0 {
+        format!("{total_minutes}:{seconds:02}")
+    } else {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    };
+    if milliseconds != 0 {
+        formatted.push_str(&format!(".{milliseconds:03}"));
+    }
+    formatted
 }
 
 fn should_use_yt_dlp(url: &str) -> bool {
@@ -123,6 +162,25 @@ pub(crate) fn youtube_format_selector(max_upload_bytes: u64, max_height: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::request::ClipRange;
+
+    fn limits() -> DownloadLimits {
+        DownloadLimits {
+            max_upload_bytes: 1_000_000,
+            command_timeout: Duration::from_secs(60),
+            upload_timeout: Duration::from_secs(60),
+            job_timeout: Duration::from_secs(60),
+        }
+    }
+
+    fn arguments(download: &DownloadCommand) -> Vec<String> {
+        download
+            .command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
     fn quality_selector_caps_every_fallback() {
@@ -135,5 +193,68 @@ mod tests {
         assert!(selector.contains("[vcodec^=avc1][height<=720][filesize<900000]"));
         assert!(selector.contains("[filesize_approx<900000]"));
         assert!(selector.ends_with(&video_format_selector(720)));
+    }
+
+    #[test]
+    fn clip_forces_yt_dlp_with_an_accurate_time_range() {
+        let range = ClipRange::new(
+            Duration::from_millis(62_500),
+            Duration::from_millis(125_250),
+        )
+        .unwrap();
+        let download = build(
+            "https://example.com/video",
+            &DownloadMode::Clip(range),
+            Path::new("cookies.txt"),
+            Path::new("/tmp/endgame-test"),
+            limits(),
+        );
+        let args = arguments(&download);
+
+        assert_eq!(download.program, "yt-dlp");
+        assert!(download.reports_progress);
+        assert!(
+            args.windows(2).any(|pair| {
+                pair[0] == "--download-sections" && pair[1] == "*1:02.500-2:05.250"
+            })
+        );
+        assert!(
+            args.iter()
+                .any(|argument| argument == "--force-keyframes-at-cuts")
+        );
+        assert!(args.iter().any(|argument| argument == "--no-playlist"));
+        assert!(!args.iter().any(|argument| argument == "--extract-audio"));
+    }
+
+    #[test]
+    fn youtube_clips_do_not_use_full_video_filesize_estimates() {
+        let range = ClipRange::new(Duration::from_secs(10), Duration::from_secs(20)).unwrap();
+        let clip = build(
+            "https://youtube.com/watch?v=example",
+            &DownloadMode::Clip(range),
+            Path::new("cookies.txt"),
+            Path::new("/tmp/endgame-test"),
+            limits(),
+        );
+        let clip_args = arguments(&clip);
+        assert!(clip_args.iter().any(|argument| argument == DEFAULT_FORMAT));
+        assert!(
+            !clip_args
+                .iter()
+                .any(|argument| argument.contains("filesize<"))
+        );
+
+        let full_video = build(
+            "https://youtube.com/watch?v=example",
+            &DownloadMode::Video { max_height: None },
+            Path::new("cookies.txt"),
+            Path::new("/tmp/endgame-test"),
+            limits(),
+        );
+        assert!(
+            arguments(&full_video)
+                .iter()
+                .any(|argument| argument.contains("filesize<"))
+        );
     }
 }

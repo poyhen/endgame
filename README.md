@@ -47,6 +47,8 @@ Queue settings, the upload limit, and timeout values must be positive integers.
 - Use `/audio <url>` for an MP3 extraction.
 - Use `/video 720p <url>` to cap video quality, or `/best <url>` for the
   unrestricted default.
+- Use `/clip 1:30 1:45 <url>` to download an accurately cut section. Timestamps
+  accept seconds, `MM:SS`, or `HH:MM:SS`, with optional millisecond precision.
 - Use `/status` or `/queue` for current queue usage, `/ping` to check whether
   the userbot is alive, and `/help` for the command summary (`/h` remains an
   alias for `/ping`).
