@@ -118,11 +118,9 @@ async fn main() -> AnyResult<()> {
         let Update::NewMessage(message) = update else {
             continue;
         };
-        log::info!(
-            "Received message (outgoing={}): {:?}",
-            message.outgoing(),
-            message.text()
-        );
+        // Messages can contain credentials (for example, `/insta` cookie data)
+        // or token-bearing URLs. Keep logs useful without persisting their content.
+        log::info!("Received message (outgoing={})", message.outgoing());
 
         if message.outgoing() {
             continue;
