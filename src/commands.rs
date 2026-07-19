@@ -8,10 +8,12 @@ const CLIP_USAGE: &str =
 
 pub enum MessageAction {
     AddUser(Option<i64>),
+    ListUsers,
     InstagramCookies,
     HealthCheck,
     QueueStatus,
     Cancel(Option<u64>),
+    Retry,
     Downloads(Vec<DownloadRequest>),
     Reply(&'static str),
     None,
@@ -25,17 +27,19 @@ pub fn classify_message(text: &str, url_pattern: &Regex) -> MessageAction {
                 .and_then(|value| value.parse().ok())
                 .filter(|user_id| *user_id > 0),
         ),
+        Some(name) if name == "users" => MessageAction::ListUsers,
         Some(name) if name == "insta" => MessageAction::InstagramCookies,
         Some(name) if name == "h" || name == "ping" => MessageAction::HealthCheck,
         Some(name) if name == "status" || name == "queue" => MessageAction::QueueStatus,
         Some(name) if name == "help" => MessageAction::Reply(
-            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /status, or /ping. Superusers can use /add <user-id>.",
+            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /status, or /ping. You can also reply to a download status with /cancel or /retry. Superusers can use /add <user-id> and /users.",
         ),
         Some(name) if name == "cancel" => MessageAction::Cancel(
             text.split_whitespace()
                 .nth(1)
                 .and_then(|value| value.parse().ok()),
         ),
+        Some(name) if name == "retry" => MessageAction::Retry,
         Some(name) if name == "clip" => classify_clip(text, url_pattern),
         Some(name) if name == "audio" => {
             let requests: Vec<_> = url_pattern
@@ -189,6 +193,34 @@ mod tests {
         assert!(matches!(
             classify_message("/cancel nope", &pattern()),
             MessageAction::Cancel(None)
+        ));
+    }
+
+    #[test]
+    fn parses_reply_commands_without_job_ids() {
+        assert!(matches!(
+            classify_message("/cancel", &pattern()),
+            MessageAction::Cancel(None)
+        ));
+        assert!(matches!(
+            classify_message("/retry", &pattern()),
+            MessageAction::Retry
+        ));
+        assert!(matches!(
+            classify_message("/retry@endgame", &pattern()),
+            MessageAction::Retry
+        ));
+    }
+
+    #[test]
+    fn parses_users_command() {
+        assert!(matches!(
+            classify_message("/users", &pattern()),
+            MessageAction::ListUsers
+        ));
+        assert!(matches!(
+            classify_message("/users@endgame", &pattern()),
+            MessageAction::ListUsers
         ));
     }
 

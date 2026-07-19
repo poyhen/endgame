@@ -13,6 +13,8 @@ use crate::jobs::progress::{JobPhase, JobProgress};
 use crate::media::pipeline;
 use crate::media::request::{DownloadLimits, DownloadOutcome, DownloadRequest};
 
+const STATUS_HISTORY_LIMIT: usize = 4_096;
+
 struct DownloadJob {
     id: u64,
     owner_id: i64,
@@ -33,6 +35,14 @@ struct QueueState {
     accepting: bool,
     pending: VecDeque<DownloadJob>,
     active: HashMap<u64, ActiveJob>,
+    status_jobs: HashMap<(i64, i32), StatusJob>,
+    status_order: VecDeque<(i64, i32)>,
+}
+
+#[derive(Clone)]
+struct StatusJob {
+    id: u64,
+    request: DownloadRequest,
 }
 
 struct SharedQueue {
@@ -55,12 +65,19 @@ pub struct DownloadQueue {
 }
 
 pub enum QueueReply {
-    Accepted(JobProgress),
+    Accepted(AcceptedReply),
     Silent,
     Message {
         message: Box<UpdateMessage>,
         text: String,
     },
+}
+
+pub(crate) struct AcceptedReply {
+    progress: JobProgress,
+    owner_id: i64,
+    request: DownloadRequest,
+    shared: Arc<SharedQueue>,
 }
 
 #[derive(Clone)]
@@ -91,6 +108,8 @@ impl DownloadQueue {
                 accepting: true,
                 pending: VecDeque::with_capacity(capacity),
                 active: HashMap::with_capacity(concurrency),
+                status_jobs: HashMap::new(),
+                status_order: VecDeque::new(),
             }),
             changed: Notify::new(),
             concurrency,
@@ -187,14 +206,19 @@ impl DownloadQueueHandle {
             id,
             owner_id,
             message,
-            request,
+            request: request.clone(),
             cancellation,
             progress: progress.clone(),
         });
         drop(state);
         self.shared.changed.notify_one();
 
-        QueueReply::Accepted(progress)
+        QueueReply::Accepted(AcceptedReply {
+            progress,
+            owner_id,
+            request,
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     pub fn try_cancel(&self, message: UpdateMessage, owner_id: i64, id: u64) -> QueueReply {
@@ -230,6 +254,44 @@ impl DownloadQueueHandle {
             format!("No cancellable job #{id} was found for your account."),
         )
     }
+
+    pub fn try_cancel_replied(
+        &self,
+        message: UpdateMessage,
+        owner_id: i64,
+        status_message_id: i32,
+    ) -> QueueReply {
+        let job_id = lock(&self.shared.state)
+            .status_jobs
+            .get(&(owner_id, status_message_id))
+            .map(|job| job.id);
+        match job_id {
+            Some(job_id) => self.try_cancel(message, owner_id, job_id),
+            None => QueueReply::message(
+                message,
+                "The replied message is not a known download status. Reply to a download status with /cancel.",
+            ),
+        }
+    }
+
+    pub fn try_retry(
+        &self,
+        message: UpdateMessage,
+        owner_id: i64,
+        status_message_id: i32,
+    ) -> QueueReply {
+        let request = lock(&self.shared.state)
+            .status_jobs
+            .get(&(owner_id, status_message_id))
+            .map(|job| job.request.clone());
+        match request {
+            Some(request) => self.try_enqueue(message, owner_id, request),
+            None => QueueReply::message(
+                message,
+                "The replied message is not a known download status. Reply to a download status with /retry.",
+            ),
+        }
+    }
 }
 
 impl QueueReply {
@@ -246,11 +308,41 @@ impl QueueReply {
 
     pub async fn send(self) {
         match self {
-            Self::Accepted(progress) => progress.attach().await,
+            Self::Accepted(AcceptedReply {
+                progress,
+                owner_id,
+                request,
+                shared,
+            }) => {
+                if let Some(status_message_id) = progress.attach().await {
+                    register_status(
+                        &shared,
+                        owner_id,
+                        status_message_id,
+                        StatusJob {
+                            id: progress.id(),
+                            request,
+                        },
+                    );
+                }
+            }
             Self::Silent => {}
             Self::Message { message, text } => {
                 let _ = message.reply(text).await;
             }
+        }
+    }
+}
+
+fn register_status(shared: &SharedQueue, owner_id: i64, status_message_id: i32, job: StatusJob) {
+    let key = (owner_id, status_message_id);
+    let mut state = lock(&shared.state);
+    if state.status_jobs.insert(key, job).is_none() {
+        state.status_order.push_back(key);
+    }
+    while state.status_order.len() > STATUS_HISTORY_LIMIT {
+        if let Some(oldest) = state.status_order.pop_front() {
+            state.status_jobs.remove(&oldest);
         }
     }
 }

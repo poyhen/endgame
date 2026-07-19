@@ -152,6 +152,15 @@ async fn main() -> AnyResult<()> {
                     users::handle_add(message, uid, user_id, supers, users).await;
                 });
             }
+            MessageAction::ListUsers => {
+                let supers = Arc::clone(&super_users);
+                let users = Arc::clone(&allowed_users);
+                let client = client.clone();
+                let session = Arc::clone(&session);
+                spawn_handler(&mut handler_tasks, async move {
+                    users::handle_list(message, uid, supers, users, client, session).await;
+                });
+            }
             MessageAction::InstagramCookies => {
                 let supers = Arc::clone(&super_users);
                 spawn_handler(&mut handler_tasks, async move {
@@ -188,9 +197,33 @@ async fn main() -> AnyResult<()> {
                 spawn_handler(&mut handler_tasks, reply.send());
             }
             MessageAction::Cancel(None) => {
-                spawn_handler(&mut handler_tasks, async move {
-                    let _ = message.reply("Usage: /cancel <job-id>").await;
-                });
+                if let Some(status_message_id) = message.reply_to_message_id() {
+                    let reply =
+                        download_queue_handle.try_cancel_replied(message, uid, status_message_id);
+                    spawn_handler(&mut handler_tasks, reply.send());
+                } else {
+                    spawn_handler(&mut handler_tasks, async move {
+                        let _ = message
+                            .reply("Usage: /cancel <job-id>, or reply to a download status with /cancel.")
+                            .await;
+                    });
+                }
+            }
+            MessageAction::Retry => {
+                if let Some(status_message_id) = message.reply_to_message_id() {
+                    let reply = download_queue_handle.try_retry(message, uid, status_message_id);
+                    if reply.is_accepted() {
+                        spawn_definitive_handler(&mut handler_tasks, reply.send());
+                    } else {
+                        spawn_handler(&mut handler_tasks, reply.send());
+                    }
+                } else {
+                    spawn_handler(&mut handler_tasks, async move {
+                        let _ = message
+                            .reply("Reply to a download status with /retry.")
+                            .await;
+                    });
+                }
             }
             MessageAction::Reply(text) => {
                 spawn_handler(&mut handler_tasks, async move {

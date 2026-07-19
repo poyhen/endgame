@@ -73,6 +73,19 @@ impl AllowedUsers {
             .contains(&user_id)
     }
 
+    pub fn list(&self) -> Vec<i64> {
+        let mut users: Vec<_> = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .users
+            .iter()
+            .copied()
+            .collect();
+        users.sort_unstable();
+        users
+    }
+
     pub fn add(&self, user_id: i64) -> anyhow::Result<AddOutcome> {
         if user_id <= 0 {
             anyhow::bail!("user ID must be positive");
@@ -146,6 +159,7 @@ mod tests {
         assert!(users.contains(11));
         assert!(users.contains(22));
         assert!(users.contains(33));
+        assert_eq!(users.list(), vec![11, 22, 33]);
 
         std::fs::remove_file(path).unwrap();
     }

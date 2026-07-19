@@ -43,7 +43,10 @@ Queue settings, the upload limit, and timeout values must be positive integers.
   numbered job.
 - Multi-item gallery downloads are returned as Telegram albums in batches of
   at most ten items.
-- Use `/cancel <job-id>` to cancel one of your queued or active jobs.
+- Use `/cancel <job-id>` to cancel one of your queued or active jobs, or reply
+  to its status message with `/cancel` so no job ID is needed.
+- Reply to any download status with `/retry` to enqueue the same download
+  again. This works regardless of whether the original job failed.
 - Use `/audio <url>` for an MP3 extraction.
 - Use `/video 720p <url>` to cap video quality, or `/best <url>` for the
   unrestricted default.
@@ -54,7 +57,8 @@ Queue settings, the upload limit, and timeout values must be positive integers.
   alias for `/ping`).
 - Superusers are implicitly authorized and can use `/add <user-id>` to authorize
   another user. Runtime additions are combined with `ALLOWED_USER_IDS` at startup
-  and persisted in `ALLOWED_USERS_FILE`.
+  and persisted in `ALLOWED_USERS_FILE`. `/users` lists everyone allowed to
+  download, including Telegram usernames and full names when available.
 - Superusers can use `/insta <cookie-content>` to replace Instagram cookies.
   The cookie message is deleted and the local file is written with owner-only
   permissions on Unix systems.

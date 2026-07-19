@@ -207,7 +207,7 @@ impl JobProgress {
         self.schedule_flush();
     }
 
-    pub(crate) async fn attach(&self) {
+    pub(crate) async fn attach(&self) -> Option<i32> {
         let initial = self.render();
         match tokio::time::timeout(
             STATUS_OPERATION_TIMEOUT,
@@ -219,8 +219,10 @@ impl JobProgress {
                 self.inner.attachment_done.store(true, Ordering::Release);
                 self.inner.status_ready.notify_waiters();
                 log::warn!("Job #{} status creation timed out", self.inner.id);
+                None
             }
             Ok(Ok(status)) => {
+                let status_message_id = status.id();
                 *lock(&self.inner.status) = Some(status.clone());
                 *lock(&self.inner.last_render) = Some(initial);
                 self.inner.attachment_done.store(true, Ordering::Release);
@@ -231,7 +233,7 @@ impl JobProgress {
                             .await
                     else {
                         self.resume_text_status();
-                        return;
+                        return Some(status_message_id);
                     };
                     let deletion =
                         match tokio::time::timeout(STATUS_OPERATION_TIMEOUT, status.delete()).await
@@ -239,7 +241,7 @@ impl JobProgress {
                             Ok(result) => result,
                             Err(_) => {
                                 self.resume_text_status();
-                                return;
+                                return Some(status_message_id);
                             }
                         };
                     if deletion.is_ok() {
@@ -256,11 +258,13 @@ impl JobProgress {
                 } else {
                     self.schedule_flush();
                 }
+                Some(status_message_id)
             }
             Ok(Err(error)) => {
                 self.inner.attachment_done.store(true, Ordering::Release);
                 self.inner.status_ready.notify_waiters();
                 log::warn!("Failed to create job status message: {error}");
+                None
             }
         }
     }
