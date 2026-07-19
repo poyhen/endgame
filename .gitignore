@@ -16,6 +16,7 @@ __pycache__
 gallery_dl_downloads
 instacookies.txt
 allowed-users.txt
+config.json
 userbot.session
 userbot.session-journal
 userbot.session-wal

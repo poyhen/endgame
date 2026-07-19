@@ -38,7 +38,7 @@ async fn main() -> AnyResult<()> {
         .with_level(log::LevelFilter::Info)
         .init();
 
-    let cfg = Config::from_env()?;
+    let cfg = Config::load()?;
 
     let session = Arc::new(SqliteSession::open(SESSION_FILE).await?);
 
@@ -74,10 +74,10 @@ async fn main() -> AnyResult<()> {
     );
 
     let super_users = Arc::new(cfg.super_users.clone());
-    let allowed_users = Arc::new(AllowedUsers::load(
-        cfg.allowed_user_ids.iter().copied(),
-        &cfg.allowed_users_file,
-    )?);
+    let allowed_users = Arc::new(AllowedUsers::new(
+        cfg.allowed_users.iter().copied(),
+        &cfg.config_path,
+    ));
     let url_pattern: Regex = cfg.url_pattern;
 
     // Don't replay updates that arrived while we were offline. Those would be
@@ -148,6 +148,13 @@ async fn main() -> AnyResult<()> {
                 let users = Arc::clone(&allowed_users);
                 spawn_handler(&mut handler_tasks, async move {
                     users::handle_add(message, uid, user_id, supers, users).await;
+                });
+            }
+            MessageAction::RemoveUser(user_id) => {
+                let supers = Arc::clone(&super_users);
+                let users = Arc::clone(&allowed_users);
+                spawn_handler(&mut handler_tasks, async move {
+                    users::handle_remove(message, uid, user_id, supers, users).await;
                 });
             }
             MessageAction::ListUsers => {

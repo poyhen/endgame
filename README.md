@@ -19,23 +19,25 @@ cargo run
 
 ## Configuration
 
-The bot reads configuration from environment variables.
+Telegram API credentials come from environment variables; everything else lives
+in a JSON config file. Copy `config.example.json` and fill in your user IDs:
+
+```sh
+cp config.example.json config.json
+```
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `API_ID` | Yes | — | Telegram API ID |
 | `API_HASH` | Yes | — | Telegram API hash |
-| `ALLOWED_USER_IDS` | Yes | — | Comma-separated Telegram user IDs |
-| `ALLOWED_USERS_FILE` | No | `allowed-users.txt` | File used to persist users added at runtime |
-| `SUPERUSERS` | No | Empty | Implicitly authorized users allowed to run administrative commands |
-| `DOWNLOAD_CONCURRENCY` | No | `2` | Maximum simultaneous download jobs |
-| `DOWNLOAD_QUEUE_CAPACITY` | No | `20` | Maximum jobs waiting in the queue |
-| `MAX_UPLOAD_SIZE_MB` | No | `1900` | Video size ceiling before adaptive transcoding |
-| `COMMAND_TIMEOUT_SECS` | No | `10800` | Deadline for yt-dlp, gallery-dl, and full video transcodes |
-| `UPLOAD_TIMEOUT_SECS` | No | `7200` | Deadline for each Telegram media upload |
-| `JOB_TIMEOUT_SECS` | No | `21600` | Overall deadline for one queued job after it starts |
+| `CONFIG_FILE` | No | `config.json` | Path to the JSON config file |
 
-Queue settings, the upload limit, and timeout values must be positive integers.
+`superusers` and `allowed_users` are Telegram user ID lists. Superusers are
+implicitly authorized and can run administrative commands. Every other key is
+optional and defaults to the value shown in `config.example.json`; all numeric
+settings must be positive integers. `/add` and `/remove` rewrite the
+`allowed_users` array in place, so edit the file by hand only while the bot is
+stopped.
 
 ## Usage
 
@@ -56,9 +58,11 @@ Queue settings, the upload limit, and timeout values must be positive integers.
   the userbot is alive, and `/help` for the command summary (`/h` remains an
   alias for `/ping`).
 - Superusers are implicitly authorized and can use `/add <user-id>` to authorize
-  another user. Runtime additions are combined with `ALLOWED_USER_IDS` at startup
-  and persisted in `ALLOWED_USERS_FILE`. `/users` lists everyone allowed to
-  download, including Telegram usernames and full names when available.
+  another user or `/remove <user-id>` to revoke access. Both commands update the
+  `allowed_users` array in the config file, so changes take effect immediately
+  and survive restarts. Superusers can only be changed by editing the config
+  file. `/users` lists everyone allowed to download, including Telegram
+  usernames and full names when available.
 - Superusers can use `/insta <cookie-content>` to replace Instagram cookies.
   The cookie message is deleted and the local file is written with owner-only
   permissions on Unix systems.

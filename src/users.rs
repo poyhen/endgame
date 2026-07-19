@@ -9,7 +9,7 @@ use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
 use tokio::task::JoinSet;
 
-use crate::telegram::allowed_users::{AddOutcome, AllowedUsers};
+use crate::telegram::allowed_users::{AddOutcome, AllowedUsers, RemoveOutcome};
 
 const USER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TELEGRAM_TEXT_LIMIT: usize = 4_000;
@@ -46,6 +46,51 @@ pub async fn handle_add(
         Err(error) => {
             log::error!("Allowed-user update task failed: {error}");
             format!("Failed to add user {user_id}: update task failed")
+        }
+    };
+    let _ = message.reply(response).await;
+}
+
+pub async fn handle_remove(
+    message: UpdateMessage,
+    sender_id: i64,
+    user_id: Option<i64>,
+    super_users: Arc<Vec<i64>>,
+    allowed_users: Arc<AllowedUsers>,
+) {
+    if !super_users.contains(&sender_id) {
+        let _ = message
+            .reply("You are not authorized to use this command.")
+            .await;
+        return;
+    }
+    let Some(user_id) = user_id else {
+        let _ = message.reply("Usage: /remove <user-id>").await;
+        return;
+    };
+    if super_users.contains(&user_id) {
+        let _ = message
+            .reply(format!(
+                "User {user_id} is a superuser; edit the config file to revoke their access."
+            ))
+            .await;
+        return;
+    }
+
+    let result = tokio::task::spawn_blocking(move || allowed_users.remove(user_id)).await;
+    let response = match result {
+        Ok(Ok(RemoveOutcome::Removed)) => {
+            log::info!("Superuser {sender_id} removed user {user_id}");
+            format!("User {user_id} removed successfully.")
+        }
+        Ok(Ok(RemoveOutcome::NotAllowed)) => format!("User {user_id} is not authorized."),
+        Ok(Err(error)) => {
+            log::error!("Superuser {sender_id} could not remove user {user_id}: {error}");
+            format!("Failed to remove user {user_id}: {error}")
+        }
+        Err(error) => {
+            log::error!("Allowed-user update task failed: {error}");
+            format!("Failed to remove user {user_id}: update task failed")
         }
     };
     let _ = message.reply(response).await;

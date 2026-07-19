@@ -8,6 +8,7 @@ const CLIP_USAGE: &str =
 
 pub enum MessageAction {
     AddUser(Option<i64>),
+    RemoveUser(Option<i64>),
     ListUsers,
     InstagramCookies,
     HealthCheck,
@@ -27,12 +28,18 @@ pub fn classify_message(text: &str, url_pattern: &Regex) -> MessageAction {
                 .and_then(|value| value.parse().ok())
                 .filter(|user_id| *user_id > 0),
         ),
+        Some(name) if name == "remove" => MessageAction::RemoveUser(
+            text.split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse().ok())
+                .filter(|user_id| *user_id > 0),
+        ),
         Some(name) if name == "users" => MessageAction::ListUsers,
         Some(name) if name == "insta" => MessageAction::InstagramCookies,
         Some(name) if name == "h" || name == "ping" => MessageAction::HealthCheck,
         Some(name) if name == "status" || name == "queue" => MessageAction::QueueStatus,
         Some(name) if name == "help" => MessageAction::Reply(
-            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /status, or /ping. You can also reply to a download status with /cancel or /retry. Superusers can use /add <user-id> and /users.",
+            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /status, or /ping. You can also reply to a download status with /cancel or /retry. Superusers can use /add <user-id>, /remove <user-id>, and /users.",
         ),
         Some(name) if name == "cancel" => MessageAction::Cancel(
             text.split_whitespace()
@@ -241,6 +248,26 @@ mod tests {
         assert!(matches!(
             classify_message("/add -1", &pattern()),
             MessageAction::AddUser(None)
+        ));
+    }
+
+    #[test]
+    fn parses_remove_command_and_rejects_invalid_ids() {
+        assert!(matches!(
+            classify_message("/remove 42", &pattern()),
+            MessageAction::RemoveUser(Some(42))
+        ));
+        assert!(matches!(
+            classify_message("/remove@endgame 7", &pattern()),
+            MessageAction::RemoveUser(Some(7))
+        ));
+        assert!(matches!(
+            classify_message("/remove nope", &pattern()),
+            MessageAction::RemoveUser(None)
+        ));
+        assert!(matches!(
+            classify_message("/remove -1", &pattern()),
+            MessageAction::RemoveUser(None)
         ));
     }
 

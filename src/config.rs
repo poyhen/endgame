@@ -1,12 +1,15 @@
 use regex::Regex;
+use serde::Deserialize;
 use std::path::PathBuf;
+
+const DEFAULT_CONFIG_PATH: &str = "config.json";
 
 pub struct Config {
     pub api_id: i32,
     pub api_hash: String,
-    pub allowed_user_ids: Vec<i64>,
-    pub allowed_users_file: PathBuf,
     pub super_users: Vec<i64>,
+    pub allowed_users: Vec<i64>,
+    pub config_path: PathBuf,
     pub url_pattern: Regex,
     pub download_concurrency: usize,
     pub download_queue_capacity: usize,
@@ -16,30 +19,62 @@ pub struct Config {
     pub job_timeout_secs: usize,
 }
 
-fn parse_id_list(value: &str) -> Result<Vec<i64>, String> {
-    value
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<i64>()
-                .map_err(|e| format!("invalid user id {s:?}: {e}"))
-        })
-        .collect()
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileConfig {
+    superusers: Vec<i64>,
+    allowed_users: Vec<i64>,
+    download_concurrency: usize,
+    download_queue_capacity: usize,
+    max_upload_size_mb: usize,
+    command_timeout_secs: usize,
+    upload_timeout_secs: usize,
+    job_timeout_secs: usize,
 }
 
-fn parse_positive_usize(name: &str, value: &str) -> anyhow::Result<usize> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
-    if parsed == 0 {
-        anyhow::bail!("{name} must be greater than zero");
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            superusers: Vec::new(),
+            allowed_users: Vec::new(),
+            download_concurrency: 2,
+            download_queue_capacity: 20,
+            max_upload_size_mb: 1900,
+            command_timeout_secs: 10800,
+            upload_timeout_secs: 7200,
+            job_timeout_secs: 21600,
+        }
     }
-    Ok(parsed)
+}
+
+impl FileConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("download_concurrency", self.download_concurrency),
+            ("download_queue_capacity", self.download_queue_capacity),
+            ("max_upload_size_mb", self.max_upload_size_mb),
+            ("command_timeout_secs", self.command_timeout_secs),
+            ("upload_timeout_secs", self.upload_timeout_secs),
+            ("job_timeout_secs", self.job_timeout_secs),
+        ] {
+            if value == 0 {
+                anyhow::bail!("{name} must be greater than zero");
+            }
+        }
+        for user_id in self.superusers.iter().chain(self.allowed_users.iter()) {
+            if *user_id <= 0 {
+                anyhow::bail!("user IDs must be positive, found {user_id}");
+            }
+        }
+        if self.superusers.is_empty() && self.allowed_users.is_empty() {
+            anyhow::bail!("config must list at least one superuser or allowed user");
+        }
+        Ok(())
+    }
 }
 
 impl Config {
-    pub fn from_env() -> anyhow::Result<Self> {
+    pub fn load() -> anyhow::Result<Self> {
         let api_id = std::env::var("API_ID")
             .ok()
             .filter(|s| !s.is_empty())
@@ -52,64 +87,37 @@ impl Config {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("API Hash must be a non-empty string"))?;
 
-        let allowed_user_ids =
-            parse_id_list(&std::env::var("ALLOWED_USER_IDS").unwrap_or_default())
-                .map_err(|e| anyhow::anyhow!("ALLOWED_USER_IDS: {e}"))?;
-        if allowed_user_ids.is_empty() {
-            anyhow::bail!(
-                "ALLOWED_USER_IDS environment variable must be set with at least one user ID"
-            );
-        }
-
-        let super_users = parse_id_list(&std::env::var("SUPERUSERS").unwrap_or_default())
-            .map_err(|e| anyhow::anyhow!("SUPERUSERS: {e}"))?;
-        let allowed_users_file = std::env::var_os("ALLOWED_USERS_FILE")
+        let config_path = std::env::var_os("CONFIG_FILE")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("allowed-users.txt"));
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+        let content = std::fs::read_to_string(&config_path).map_err(|error| {
+            anyhow::anyhow!(
+                "could not read {}: {error} (copy config.example.json and fill in your user IDs)",
+                config_path.display()
+            )
+        })?;
+        let file_config: FileConfig = serde_json::from_str(&content)
+            .map_err(|error| anyhow::anyhow!("invalid {}: {error}", config_path.display()))?;
+        file_config.validate()?;
 
         // NOTE: `$-_` is an ASCII range (0x24..=0x5F) that includes `/`, `:`, `?`, `=`, etc.
         // This mirrors the original Python regex `[$-_@.&+]` exactly (the `-` is NOT escaped).
         let url_pattern = Regex::new(r"https?://(?:[$-_@.&+!*(),a-zA-Z0-9]|(?:%[0-9a-fA-F]{2}))+")?;
 
-        let download_concurrency = parse_positive_usize(
-            "DOWNLOAD_CONCURRENCY",
-            &std::env::var("DOWNLOAD_CONCURRENCY").unwrap_or_else(|_| "2".to_string()),
-        )?;
-        let download_queue_capacity = parse_positive_usize(
-            "DOWNLOAD_QUEUE_CAPACITY",
-            &std::env::var("DOWNLOAD_QUEUE_CAPACITY").unwrap_or_else(|_| "20".to_string()),
-        )?;
-        let max_upload_size_mb = parse_positive_usize(
-            "MAX_UPLOAD_SIZE_MB",
-            &std::env::var("MAX_UPLOAD_SIZE_MB").unwrap_or_else(|_| "1900".to_string()),
-        )?;
-        let command_timeout_secs = parse_positive_usize(
-            "COMMAND_TIMEOUT_SECS",
-            &std::env::var("COMMAND_TIMEOUT_SECS").unwrap_or_else(|_| "10800".to_string()),
-        )?;
-        let upload_timeout_secs = parse_positive_usize(
-            "UPLOAD_TIMEOUT_SECS",
-            &std::env::var("UPLOAD_TIMEOUT_SECS").unwrap_or_else(|_| "7200".to_string()),
-        )?;
-        let job_timeout_secs = parse_positive_usize(
-            "JOB_TIMEOUT_SECS",
-            &std::env::var("JOB_TIMEOUT_SECS").unwrap_or_else(|_| "21600".to_string()),
-        )?;
-
         Ok(Self {
             api_id,
             api_hash,
-            allowed_user_ids,
-            allowed_users_file,
-            super_users,
+            super_users: file_config.superusers,
+            allowed_users: file_config.allowed_users,
+            config_path,
             url_pattern,
-            download_concurrency,
-            download_queue_capacity,
-            max_upload_size_mb,
-            command_timeout_secs,
-            upload_timeout_secs,
-            job_timeout_secs,
+            download_concurrency: file_config.download_concurrency,
+            download_queue_capacity: file_config.download_queue_capacity,
+            max_upload_size_mb: file_config.max_upload_size_mb,
+            command_timeout_secs: file_config.command_timeout_secs,
+            upload_timeout_secs: file_config.upload_timeout_secs,
+            job_timeout_secs: file_config.job_timeout_secs,
         })
     }
 }
@@ -139,15 +147,53 @@ mod tests {
     }
 
     #[test]
-    fn accepts_positive_queue_settings() {
-        assert_eq!(parse_positive_usize("TEST", "1").unwrap(), 1);
-        assert_eq!(parse_positive_usize("TEST", "32").unwrap(), 32);
+    fn applies_defaults_for_missing_optional_keys() {
+        let cfg: FileConfig = serde_json::from_str(r#"{"superusers": [1]}"#).unwrap();
+        assert_eq!(cfg.superusers, vec![1]);
+        assert!(cfg.allowed_users.is_empty());
+        assert_eq!(cfg.download_concurrency, 2);
+        assert_eq!(cfg.download_queue_capacity, 20);
+        assert_eq!(cfg.max_upload_size_mb, 1900);
+        assert_eq!(cfg.command_timeout_secs, 10800);
+        assert_eq!(cfg.upload_timeout_secs, 7200);
+        assert_eq!(cfg.job_timeout_secs, 21600);
+        cfg.validate().unwrap();
     }
 
     #[test]
-    fn rejects_invalid_queue_settings() {
-        assert!(parse_positive_usize("TEST", "0").is_err());
-        assert!(parse_positive_usize("TEST", "-1").is_err());
-        assert!(parse_positive_usize("TEST", "many").is_err());
+    fn rejects_invalid_config_values() {
+        let zero: FileConfig = serde_json::from_str(
+            r#"{"superusers": [1], "download_queue_capacity": 0}"#,
+        )
+        .unwrap();
+        assert!(zero.validate().is_err());
+
+        let negative_id: FileConfig =
+            serde_json::from_str(r#"{"allowed_users": [-1]}"#).unwrap();
+        assert!(negative_id.validate().is_err());
+
+        let nobody: FileConfig = serde_json::from_str("{}").unwrap();
+        assert!(nobody.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_config_keys() {
+        let error = serde_json::from_str::<FileConfig>(
+            r#"{"superusers": [1], "download_concurency": 4}"#,
+        )
+        .err()
+        .expect("a misspelled config key must be rejected");
+
+        assert!(
+            error.to_string().contains("unknown field `download_concurency`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn committed_example_config_stays_valid() {
+        let cfg: FileConfig =
+            serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        cfg.validate().unwrap();
     }
 }

@@ -537,6 +537,8 @@ dependencies = [
  "mime_guess",
  "rand 0.8.6",
  "regex",
+ "serde",
+ "serde_json",
  "simple_logger",
  "tokio",
 ]
