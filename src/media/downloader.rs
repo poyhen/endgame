@@ -130,6 +130,7 @@ fn should_use_yt_dlp(url: &str) -> bool {
         "youtube.com/",
         "youtu.be/",
         "instagram.com/share/",
+        "instagram.com/reel/",
         "instagram.com/reels/",
         "instagram.com/tv/",
         "x.com/i/broadcasts/",
@@ -193,6 +194,25 @@ mod tests {
         assert!(selector.contains("[vcodec^=avc1][height<=720][filesize<900000]"));
         assert!(selector.contains("[filesize_approx<900000]"));
         assert!(selector.ends_with(&video_format_selector(720)));
+    }
+
+    #[test]
+    fn instagram_reel_urls_use_yt_dlp() {
+        for url in [
+            "https://www.instagram.com/reel/DbAFv_jMyOy/?igsh=Zmk3cGl5eTNmNGk4",
+            "https://www.instagram.com/reels/DbAFv_jMyOy/",
+        ] {
+            let download = build(
+                url,
+                &DownloadMode::Video { max_height: None },
+                Path::new("instacookies.txt"),
+                Path::new("/tmp/endgame-test"),
+                limits(),
+            );
+
+            assert_eq!(download.program, "yt-dlp", "unexpected downloader for {url}");
+            assert!(download.reports_progress);
+        }
     }
 
     #[test]
