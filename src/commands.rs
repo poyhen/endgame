@@ -2,14 +2,34 @@ use regex::Regex;
 use std::time::Duration;
 
 use crate::media::request::{ClipRange, DownloadRequest};
+use crate::policy::{PackageName, UserLimitName, UserLimitValue};
 
 const CLIP_USAGE: &str =
     "Usage: /clip <start> <end> <url> (timestamps: SS, MM:SS, or HH:MM:SS[.mmm])";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatsTarget {
+    Own,
+    User(i64),
+    All,
+}
 
 pub enum MessageAction {
     AddUser(Option<i64>),
     RemoveUser(Option<i64>),
     ListUsers,
+    SetUserPackage {
+        user_id: Option<i64>,
+        package: Option<PackageName>,
+    },
+    ListPackages,
+    ShowUserLimits(Option<i64>),
+    SetUserLimit {
+        user_id: Option<i64>,
+        name: Option<UserLimitName>,
+        value: Option<UserLimitValue>,
+    },
+    ShowStats(StatsTarget),
     InstagramCookies,
     HealthCheck,
     QueueStatus,
@@ -35,11 +55,53 @@ pub fn classify_message(text: &str, url_pattern: &Regex) -> MessageAction {
                 .filter(|user_id| *user_id > 0),
         ),
         Some(name) if name == "users" => MessageAction::ListUsers,
+        Some(name) if name == "package" || name == "tier" => {
+            let mut parts = text.split_whitespace().skip(1);
+            MessageAction::SetUserPackage {
+                user_id: parts
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|user_id| *user_id > 0),
+                package: parts.next().and_then(PackageName::parse),
+            }
+        }
+        Some(name) if name == "packages" => MessageAction::ListPackages,
+        Some(name) if name == "limits" => {
+            let target = text.split_whitespace().nth(1);
+            match target {
+                None => MessageAction::ShowUserLimits(None),
+                Some(value) => match value.parse::<i64>().ok().filter(|user_id| *user_id > 0) {
+                    Some(user_id) => MessageAction::ShowUserLimits(Some(user_id)),
+                    None => MessageAction::Reply("Usage: /limits [user-id]"),
+                },
+            }
+        }
+        Some(name) if name == "limit" => {
+            let mut parts = text.split_whitespace().skip(1);
+            MessageAction::SetUserLimit {
+                user_id: parts
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|user_id| *user_id > 0),
+                name: parts.next().and_then(UserLimitName::parse),
+                value: parts.next().and_then(UserLimitValue::parse),
+            }
+        }
+        Some(name) if name == "stats" => match text.split_whitespace().nth(1) {
+            None => MessageAction::ShowStats(StatsTarget::Own),
+            Some(value) if value.eq_ignore_ascii_case("all") => {
+                MessageAction::ShowStats(StatsTarget::All)
+            }
+            Some(value) => match value.parse::<i64>().ok().filter(|user_id| *user_id > 0) {
+                Some(user_id) => MessageAction::ShowStats(StatsTarget::User(user_id)),
+                None => MessageAction::Reply("Usage: /stats [user-id|all]"),
+            },
+        },
         Some(name) if name == "insta" => MessageAction::InstagramCookies,
         Some(name) if name == "h" || name == "ping" => MessageAction::HealthCheck,
         Some(name) if name == "status" || name == "queue" => MessageAction::QueueStatus,
         Some(name) if name == "help" => MessageAction::Reply(
-            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /status, or /ping. You can also reply to a download status with /cancel or /retry. Superusers can use /add <user-id>, /remove <user-id>, and /users.",
+            "Send links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /retry, /status, /limits, /stats, /packages, or /ping. Superusers can use /add, /remove, /package <user-id> <name> (legacy alias: /tier), /limit, /stats all, and /users.",
         ),
         Some(name) if name == "cancel" => MessageAction::Cancel(
             text.split_whitespace()
@@ -228,6 +290,68 @@ mod tests {
         assert!(matches!(
             classify_message("/users@endgame", &pattern()),
             MessageAction::ListUsers
+        ));
+    }
+
+    #[test]
+    fn parses_user_policy_commands() {
+        assert!(matches!(
+            classify_message("/package 42 pro_monthly", &pattern()),
+            MessageAction::SetUserPackage {
+                user_id: Some(42),
+                package: Some(ref package),
+            } if package.as_str() == "pro_monthly"
+        ));
+        assert!(matches!(
+            classify_message("/tier 42 enterprise", &pattern()),
+            MessageAction::SetUserPackage {
+                user_id: Some(42),
+                package: Some(ref package),
+            } if package.as_str() == "enterprise"
+        ));
+        assert!(matches!(
+            classify_message("/packages", &pattern()),
+            MessageAction::ListPackages
+        ));
+        assert!(matches!(
+            classify_message("/limits", &pattern()),
+            MessageAction::ShowUserLimits(None)
+        ));
+        assert!(matches!(
+            classify_message("/limits 42", &pattern()),
+            MessageAction::ShowUserLimits(Some(42))
+        ));
+        assert!(matches!(
+            classify_message("/limit 42 queue 7", &pattern()),
+            MessageAction::SetUserLimit {
+                user_id: Some(42),
+                name: Some(UserLimitName::MaxQueuedJobs),
+                value: Some(UserLimitValue::Value(7)),
+            }
+        ));
+        assert!(matches!(
+            classify_message("/limit 42 daily default", &pattern()),
+            MessageAction::SetUserLimit {
+                user_id: Some(42),
+                name: Some(UserLimitName::DailyJobLimit),
+                value: Some(UserLimitValue::Default),
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_statistics_targets() {
+        assert!(matches!(
+            classify_message("/stats", &pattern()),
+            MessageAction::ShowStats(StatsTarget::Own)
+        ));
+        assert!(matches!(
+            classify_message("/stats 42", &pattern()),
+            MessageAction::ShowStats(StatsTarget::User(42))
+        ));
+        assert!(matches!(
+            classify_message("/stats all", &pattern()),
+            MessageAction::ShowStats(StatsTarget::All)
         ));
     }
 

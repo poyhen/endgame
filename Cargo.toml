@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 grammers-client = { git = "https://codeberg.org/Lonami/grammers.git", rev = "bafe16b9d9e8940f5a0d94c7466171b6c754144e" }
 grammers-session = { git = "https://codeberg.org/Lonami/grammers.git", rev = "bafe16b9d9e8940f5a0d94c7466171b6c754144e", features = ["sqlite-storage"] }
+turso = { version = "0.6.1", default-features = false }
 tokio = { version = "1", features = [
   "fs",
   "io-util",

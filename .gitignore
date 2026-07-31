@@ -20,6 +20,11 @@ config.json
 userbot.session
 userbot.session-journal
 userbot.session-wal
+endgame.db
+endgame.db-journal
+endgame.db-shm
+endgame.db-tshm
+endgame.db-wal
 
 # Added by cargo
 

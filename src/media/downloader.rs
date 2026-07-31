@@ -46,7 +46,13 @@ pub fn build(
                     .arg("--audio-format")
                     .arg("mp3")
                     .arg("--audio-quality")
-                    .arg("0");
+                    .arg("0")
+                    // Keep the source's music information and artwork in the
+                    // downloaded file so it remains useful outside Telegram.
+                    .arg("--embed-metadata")
+                    .arg("--embed-thumbnail")
+                    .arg("--convert-thumbnails")
+                    .arg("jpg");
             }
             DownloadMode::Clip(range) => {
                 // Full-source filesize estimates would unnecessarily downgrade a short
@@ -210,7 +216,10 @@ mod tests {
                 limits(),
             );
 
-            assert_eq!(download.program, "yt-dlp", "unexpected downloader for {url}");
+            assert_eq!(
+                download.program, "yt-dlp",
+                "unexpected downloader for {url}"
+            );
             assert!(download.reports_progress);
         }
     }
@@ -244,6 +253,29 @@ mod tests {
         );
         assert!(args.iter().any(|argument| argument == "--no-playlist"));
         assert!(!args.iter().any(|argument| argument == "--extract-audio"));
+    }
+
+    #[test]
+    fn audio_downloads_embed_metadata_and_cover_art() {
+        let download = build(
+            "https://youtube.com/watch?v=example",
+            &DownloadMode::Audio,
+            Path::new("cookies.txt"),
+            Path::new("/tmp/endgame-test"),
+            limits(),
+        );
+        let args = arguments(&download);
+
+        for expected in ["--extract-audio", "--embed-metadata", "--embed-thumbnail"] {
+            assert!(
+                args.iter().any(|argument| argument == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--convert-thumbnails" && pair[1] == "jpg")
+        );
     }
 
     #[test]

@@ -541,6 +541,7 @@ dependencies = [
  "serde_json",
  "simple_logger",
  "tokio",
+ "turso",
 ]
 
 [[package]]

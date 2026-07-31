@@ -1,17 +1,19 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use grammers_client::Client;
 use grammers_client::update::Message as UpdateMessage;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::cancel::CancellationToken;
 use crate::jobs::progress::{JobPhase, JobProgress};
 use crate::media::pipeline;
 use crate::media::request::{DownloadLimits, DownloadOutcome, DownloadRequest};
+use crate::policy::EffectiveUserLimits;
+use crate::store::{AppStore, DownloadStatOutcome};
 
 const STATUS_HISTORY_LIMIT: usize = 4_096;
 
@@ -20,6 +22,7 @@ struct DownloadJob {
     owner_id: i64,
     message: UpdateMessage,
     request: DownloadRequest,
+    user_limits: EffectiveUserLimits,
     cancellation: CancellationToken,
     progress: JobProgress,
 }
@@ -52,6 +55,12 @@ struct SharedQueue {
     capacity: usize,
     limits: DownloadLimits,
     next_id: AtomicU64,
+    stats: mpsc::UnboundedSender<DownloadStatEvent>,
+}
+
+struct DownloadStatEvent {
+    owner_id: i64,
+    outcome: DownloadStatOutcome,
 }
 
 #[derive(Clone)]
@@ -62,6 +71,7 @@ pub struct DownloadQueueHandle {
 pub struct DownloadQueue {
     handle: DownloadQueueHandle,
     runner: JoinHandle<()>,
+    stats_runner: JoinHandle<()>,
 }
 
 pub enum QueueReply {
@@ -99,9 +109,25 @@ impl DownloadQueue {
         concurrency: usize,
         capacity: usize,
         limits: DownloadLimits,
+        store: Arc<AppStore>,
     ) -> Self {
         assert!(concurrency > 0, "download concurrency must be positive");
         assert!(capacity > 0, "download queue capacity must be positive");
+
+        let (stats, mut stats_rx) = mpsc::unbounded_channel::<DownloadStatEvent>();
+        let stats_runner = tokio::spawn(async move {
+            while let Some(event) = stats_rx.recv().await {
+                if let Err(error) = store
+                    .record_download_outcome(event.owner_id, event.outcome)
+                    .await
+                {
+                    log::error!(
+                        "Could not record download outcome for user {}: {error}",
+                        event.owner_id
+                    );
+                }
+            }
+        });
 
         let shared = Arc::new(SharedQueue {
             state: Mutex::new(QueueState {
@@ -116,6 +142,7 @@ impl DownloadQueue {
             capacity,
             limits,
             next_id: AtomicU64::new(1),
+            stats,
         });
         let runner_shared = Arc::clone(&shared);
         let runner = tokio::spawn(run_queue(runner_shared, client));
@@ -123,6 +150,7 @@ impl DownloadQueue {
         Self {
             handle: DownloadQueueHandle { shared },
             runner,
+            stats_runner,
         }
     }
 
@@ -131,7 +159,11 @@ impl DownloadQueue {
     }
 
     pub async fn shutdown(self) {
-        let Self { handle, runner } = self;
+        let Self {
+            handle,
+            runner,
+            stats_runner,
+        } = self;
         {
             let mut state = lock(&handle.shared.state);
             state.accepting = false;
@@ -141,6 +173,9 @@ impl DownloadQueue {
 
         if let Err(error) = runner.await {
             log::warn!("Download queue ended unexpectedly: {error}");
+        }
+        if let Err(error) = stats_runner.await {
+            log::warn!("Download statistics recorder ended unexpectedly: {error}");
         }
     }
 }
@@ -179,6 +214,7 @@ impl DownloadQueueHandle {
         message: UpdateMessage,
         owner_id: i64,
         request: DownloadRequest,
+        user_limits: EffectiveUserLimits,
     ) -> QueueReply {
         let mut state = lock(&self.shared.state);
         if !state.accepting {
@@ -198,6 +234,20 @@ impl DownloadQueueHandle {
                 ),
             );
         }
+        let owner_queued = state
+            .pending
+            .iter()
+            .filter(|job| job.owner_id == owner_id)
+            .count();
+        if owner_queued >= user_limits.max_queued_jobs {
+            return QueueReply::message(
+                message,
+                format!(
+                    "Your download queue is full ({owner_queued}/{} waiting).",
+                    user_limits.max_queued_jobs
+                ),
+            );
+        }
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
@@ -207,6 +257,7 @@ impl DownloadQueueHandle {
             owner_id,
             message,
             request: request.clone(),
+            user_limits,
             cancellation,
             progress: progress.clone(),
         });
@@ -233,6 +284,7 @@ impl DownloadQueueHandle {
             job.cancellation.cancel();
             job.progress.set_phase(JobPhase::Cancelled);
             drop(state);
+            record_download_stat(&self.shared, owner_id, DownloadStatOutcome::Cancelled);
             self.shared.changed.notify_one();
             return QueueReply::Silent;
         }
@@ -274,23 +326,11 @@ impl DownloadQueueHandle {
         }
     }
 
-    pub fn try_retry(
-        &self,
-        message: UpdateMessage,
-        owner_id: i64,
-        status_message_id: i32,
-    ) -> QueueReply {
-        let request = lock(&self.shared.state)
+    pub fn retry_request(&self, owner_id: i64, status_message_id: i32) -> Option<DownloadRequest> {
+        lock(&self.shared.state)
             .status_jobs
             .get(&(owner_id, status_message_id))
-            .map(|job| job.request.clone());
-        match request {
-            Some(request) => self.try_enqueue(message, owner_id, request),
-            None => QueueReply::message(
-                message,
-                "The replied message is not a known download status. Reply to a download status with /retry.",
-            ),
-        }
+            .map(|job| job.request.clone())
     }
 }
 
@@ -299,7 +339,7 @@ impl QueueReply {
         matches!(self, Self::Accepted(_))
     }
 
-    fn message(message: UpdateMessage, text: impl Into<String>) -> Self {
+    pub(crate) fn message(message: UpdateMessage, text: impl Into<String>) -> Self {
         Self::Message {
             message: Box::new(message),
             text: text.into(),
@@ -355,7 +395,10 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
             let job = {
                 let mut state = lock(&shared.state);
                 let position = next_pending_position(
-                    state.pending.iter().map(|job| job.owner_id),
+                    state
+                        .pending
+                        .iter()
+                        .map(|job| (job.owner_id, job.user_limits.max_active_jobs)),
                     state.active.values().map(|job| job.owner_id),
                 );
                 let job = position.and_then(|position| state.pending.remove(position));
@@ -377,7 +420,8 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
             };
             let client = client.clone();
             let job_shared = Arc::clone(&shared);
-            let limits = shared.limits;
+            let mut limits = shared.limits;
+            limits.max_upload_bytes = job.user_limits.max_upload_bytes;
             tasks.spawn(async move {
                 let _active_guard = ActiveJobGuard {
                     id: job.id,
@@ -387,6 +431,7 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
                 let cancellation = job.cancellation.clone();
                 let watchdog_cancellation = job.cancellation.clone();
                 let worker_progress = job.progress.clone();
+                let owner_id = job.owner_id;
                 let mut worker = tokio::spawn(async move {
                     worker_progress.downloading();
                     if cancellation.is_cancelled() {
@@ -425,7 +470,7 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
                         DownloadOutcome::Failed
                     }
                 };
-                (result_progress, outcome)
+                (owner_id, result_progress, outcome)
             });
         }
 
@@ -440,13 +485,23 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
         tokio::select! {
             result = tasks.join_next(), if !tasks.is_empty() => {
                 match result {
-                    Some(Ok((progress, outcome))) => {
-                        let phase = match outcome {
-                            DownloadOutcome::Completed => JobPhase::Completed,
-                            DownloadOutcome::Failed => JobPhase::Failed,
-                            DownloadOutcome::Cancelled => JobPhase::Cancelled,
+                    Some(Ok((owner_id, progress, outcome))) => {
+                        let (phase, stat) = match outcome {
+                            DownloadOutcome::Completed => (
+                                JobPhase::Completed,
+                                DownloadStatOutcome::Completed,
+                            ),
+                            DownloadOutcome::Failed => (
+                                JobPhase::Failed,
+                                DownloadStatOutcome::Failed,
+                            ),
+                            DownloadOutcome::Cancelled => (
+                                JobPhase::Cancelled,
+                                DownloadStatOutcome::Cancelled,
+                            ),
                         };
                         progress.set_phase(phase);
+                        record_download_stat(&shared, owner_id, stat);
                     }
                     Some(Err(error)) => log::error!(
                         "Download queue wrapper ended unexpectedly; this is a queue bug: {error}"
@@ -459,6 +514,16 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
     }
 }
 
+fn record_download_stat(shared: &SharedQueue, owner_id: i64, outcome: DownloadStatOutcome) {
+    if shared
+        .stats
+        .send(DownloadStatEvent { owner_id, outcome })
+        .is_err()
+    {
+        log::error!("Download statistics recorder is unavailable");
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -466,20 +531,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn next_pending_position(
-    pending_owners: impl IntoIterator<Item = i64>,
+    pending_jobs: impl IntoIterator<Item = (i64, usize)>,
     active_owners: impl IntoIterator<Item = i64>,
 ) -> Option<usize> {
-    let active: HashSet<_> = active_owners.into_iter().collect();
-    let mut has_pending = false;
-
-    for (position, owner_id) in pending_owners.into_iter().enumerate() {
-        has_pending = true;
-        if !active.contains(&owner_id) {
+    let mut active_counts = HashMap::new();
+    for owner_id in active_owners {
+        *active_counts.entry(owner_id).or_insert(0usize) += 1;
+    }
+    let pending_jobs: Vec<_> = pending_jobs.into_iter().collect();
+    let mut below_limit = None;
+    for (position, (owner_id, max_active_jobs)) in pending_jobs.into_iter().enumerate() {
+        let active = active_counts.get(&owner_id).copied().unwrap_or_default();
+        if active == 0 {
             return Some(position);
         }
+        if active < max_active_jobs && below_limit.is_none() {
+            below_limit = Some(position);
+        }
     }
-
-    has_pending.then_some(0)
+    below_limit
 }
 
 #[cfg(test)]
@@ -488,18 +558,27 @@ mod tests {
 
     #[test]
     fn prefers_a_user_without_an_active_job() {
-        assert_eq!(next_pending_position([11, 11, 22], [11]), Some(2));
+        assert_eq!(
+            next_pending_position([(11, 2), (11, 2), (22, 1)], [11]),
+            Some(2)
+        );
     }
 
     #[test]
     fn preserves_fifo_among_users_without_active_jobs() {
-        assert_eq!(next_pending_position([11, 22, 33], [11]), Some(1));
+        assert_eq!(
+            next_pending_position([(11, 2), (22, 1), (33, 1)], [11]),
+            Some(1)
+        );
     }
 
     #[test]
-    fn keeps_workers_busy_when_every_pending_user_is_active() {
-        assert_eq!(next_pending_position([11, 22, 11], [11, 22]), Some(0));
-        assert_eq!(next_pending_position([11, 11], [11]), Some(0));
+    fn uses_spare_per_user_capacity_after_fairness() {
+        assert_eq!(
+            next_pending_position([(11, 2), (22, 1), (11, 2)], [11, 22]),
+            Some(0)
+        );
+        assert_eq!(next_pending_position([(11, 1), (11, 1)], [11]), None);
     }
 
     #[test]

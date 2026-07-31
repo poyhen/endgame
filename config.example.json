@@ -1,6 +1,31 @@
 {
   "superusers": [123456789],
   "allowed_users": [123456789, 987654321],
+  "database": {
+    "path": "endgame.db"
+  },
+  "default_package": "free",
+  "superuser_package": "paid",
+  "packages": {
+    "free": {
+      "max_active_jobs": 1,
+      "max_queued_jobs": 3,
+      "daily_job_limit": 20,
+      "max_upload_size_mb": 500
+    },
+    "pro": {
+      "max_active_jobs": 2,
+      "max_queued_jobs": 10,
+      "daily_job_limit": 100,
+      "max_upload_size_mb": 1000
+    },
+    "paid": {
+      "max_active_jobs": 2,
+      "max_queued_jobs": 20,
+      "daily_job_limit": null,
+      "max_upload_size_mb": 1900
+    }
+  },
   "download_concurrency": 2,
   "download_queue_capacity": 20,
   "max_upload_size_mb": 1900,

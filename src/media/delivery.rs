@@ -11,7 +11,9 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::cancel::CancellationToken;
 use crate::jobs::JobProgress;
-use crate::media::inspect::extract_thumbnail;
+use crate::media::inspect::{
+    AudioMetadata, extract_audio_thumbnail, extract_thumbnail, probe_audio,
+};
 use crate::media::request::{DownloadLimits, DownloadOutcome};
 use crate::media::transcode::prepare_video;
 
@@ -115,14 +117,35 @@ async fn upload_file_with_progress(
     position: (usize, usize),
     upload_timeout: Duration,
 ) -> anyhow::Result<Uploaded> {
-    let file = tokio::fs::File::open(path).await?;
-    let total_bytes = file.metadata().await?.len();
-    let size = usize::try_from(total_bytes)
-        .map_err(|_| anyhow::anyhow!("file is too large for this platform"))?;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow::anyhow!("upload path has no file name"))?;
+    upload_file_with_name_and_progress(
+        client,
+        path,
+        name,
+        cancellation,
+        progress,
+        position,
+        upload_timeout,
+    )
+    .await
+}
+
+async fn upload_file_with_name_and_progress(
+    client: &Client,
+    path: &Path,
+    upload_name: String,
+    cancellation: &CancellationToken,
+    progress: &JobProgress,
+    position: (usize, usize),
+    upload_timeout: Duration,
+) -> anyhow::Result<Uploaded> {
+    let file = tokio::fs::File::open(path).await?;
+    let total_bytes = file.metadata().await?.len();
+    let size = usize::try_from(total_bytes)
+        .map_err(|_| anyhow::anyhow!("file is too large for this platform"))?;
     let mut reader = ProgressReader::new(file, progress.clone(), position, total_bytes);
 
     let uploaded = tokio::select! {
@@ -132,7 +155,7 @@ async fn upload_file_with_progress(
             "Telegram upload timed out after {} seconds",
             upload_timeout.as_secs()
         ),
-        result = client.upload_stream(&mut reader, size, name) => result?,
+        result = client.upload_stream(&mut reader, size, upload_name) => result?,
     };
     progress.upload_progress(position.0, position.1, total_bytes, total_bytes);
     Ok(uploaded)
@@ -410,22 +433,181 @@ pub(crate) async fn send_audio(
     limits: DownloadLimits,
     delivery: DeliveryPlan,
 ) -> anyhow::Result<()> {
-    let audio = upload_file_with_progress(
+    let operation = format!("Job #{}", progress.id());
+    progress.inspecting();
+    let metadata = probe_audio(path, cancellation, UTILITY_COMMAND_TIMEOUT, &operation).await?;
+    let metadata = prepare_audio_metadata(path, metadata);
+
+    progress.thumbnailing();
+    let thumbnail =
+        extract_audio_thumbnail(path, cancellation, UTILITY_COMMAND_TIMEOUT, &operation)
+            .await
+            .map_err(|error| {
+                log::warn!("{operation} | Could not prepare audio cover: {error}");
+                error
+            })
+            .ok();
+
+    let audio = upload_file_with_name_and_progress(
         client,
         path,
+        metadata.file_name,
         cancellation,
         progress,
         delivery.position,
         limits.upload_timeout,
     )
     .await?;
-    deliver_media(
-        message,
-        progress,
-        InputMessage::new().document(audio),
-        delivery.replace_status,
-    )
-    .await
+    let mut input = InputMessage::new()
+        .document(audio)
+        .attribute(Attribute::Audio {
+            duration: metadata.duration,
+            title: Some(metadata.title),
+            performer: metadata.performer,
+        });
+    if let Some(thumbnail) = &thumbnail
+        && let Ok(Ok(thumb)) =
+            tokio::time::timeout(TELEGRAM_OPERATION_TIMEOUT, client.upload_file(thumbnail)).await
+    {
+        input = input.thumbnail(thumb);
+    }
+    deliver_media(message, progress, input, delivery.replace_status).await
+}
+
+struct PreparedAudioMetadata {
+    duration: Duration,
+    title: String,
+    performer: Option<String>,
+    file_name: String,
+}
+
+fn prepare_audio_metadata(path: &Path, metadata: AudioMetadata) -> PreparedAudioMetadata {
+    let mut title = metadata
+        .title
+        .as_deref()
+        .and_then(clean_audio_text)
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|stem| clean_audio_text(&stem.to_string_lossy()))
+        })
+        .unwrap_or_else(|| "Audio".to_string());
+    let mut performer = metadata.performer.as_deref().and_then(clean_audio_text);
+
+    if let Some((title_artist, track_title)) = split_artist_and_title(&title)
+        && performer
+            .as_deref()
+            .is_none_or(|performer| artists_match(performer, title_artist))
+    {
+        performer = Some(title_artist.to_string());
+        title = track_title.to_string();
+    }
+
+    title = truncate_utf8(&title, 256);
+    performer = performer.map(|performer| truncate_utf8(&performer, 256));
+    let file_name = audio_file_name(path, performer.as_deref(), &title);
+    PreparedAudioMetadata {
+        duration: metadata.duration,
+        title,
+        performer,
+        file_name,
+    }
+}
+
+fn clean_audio_text(value: &str) -> Option<String> {
+    let cleaned: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn split_artist_and_title(title: &str) -> Option<(&str, &str)> {
+    let (artist, title) = title.split_once(" - ")?;
+    let artist = artist.trim();
+    let title = title.trim();
+    (!artist.is_empty() && !title.is_empty()).then_some((artist, title))
+}
+
+fn artists_match(left: &str, right: &str) -> bool {
+    let left = artist_key(left);
+    !left.is_empty() && left == artist_key(right)
+}
+
+fn artist_key(value: &str) -> String {
+    let mut key: String = value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect();
+    for suffix in [
+        "officialartistchannel",
+        "official",
+        "recordings",
+        "records",
+        "music",
+        "topic",
+        "channel",
+        "vevo",
+        "tv",
+    ] {
+        if key.len() > suffix.len() && key.ends_with(suffix) {
+            key.truncate(key.len() - suffix.len());
+            break;
+        }
+    }
+    key
+}
+
+fn audio_file_name(path: &Path, performer: Option<&str>, title: &str) -> String {
+    let base = performer
+        .map(|performer| format!("{performer} - {title}"))
+        .unwrap_or_else(|| title.to_string());
+    let safe_base: String = base
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            character if character.is_control() => ' ',
+            character => character,
+        })
+        .collect();
+    let safe_base = safe_base.split_whitespace().collect::<Vec<_>>().join(" ");
+    let safe_base = safe_base.trim_matches(|character| character == '.' || character == ' ');
+    let safe_base = if safe_base.is_empty() {
+        "Audio"
+    } else {
+        safe_base
+    };
+    let safe_base = truncate_utf8(safe_base, 180);
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .unwrap_or("mp3")
+        .to_ascii_lowercase();
+    format!("{safe_base}.{extension}")
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].trim_end().to_string()
 }
 
 async fn deliver_media(
@@ -504,5 +686,40 @@ mod tests {
         assert_eq!(in_flight_upload_bytes(500, 1_000), 500);
         assert_eq!(in_flight_upload_bytes(1_000, 1_000), 999);
         assert_eq!(in_flight_upload_bytes(2_000, 1_000), 999);
+    }
+
+    #[test]
+    fn prepares_music_fields_and_a_clean_download_name() {
+        let metadata = prepare_audio_metadata(
+            Path::new("media.mp3"),
+            AudioMetadata {
+                duration: Duration::from_secs(187),
+                title: Some("Good Morning / Radio Edit".into()),
+                performer: Some("Kanye West".into()),
+            },
+        );
+
+        assert_eq!(metadata.title, "Good Morning / Radio Edit");
+        assert_eq!(metadata.performer.as_deref(), Some("Kanye West"));
+        assert_eq!(
+            metadata.file_name,
+            "Kanye West - Good Morning Radio Edit.mp3"
+        );
+    }
+
+    #[test]
+    fn replaces_a_matching_channel_name_with_the_artist_from_the_title() {
+        let metadata = prepare_audio_metadata(
+            Path::new("media.mp3"),
+            AudioMetadata {
+                duration: Duration::ZERO,
+                title: Some("Kanye West - Good Morning".into()),
+                performer: Some("KanyeWestVEVO".into()),
+            },
+        );
+
+        assert_eq!(metadata.title, "Good Morning");
+        assert_eq!(metadata.performer.as_deref(), Some("Kanye West"));
+        assert_eq!(metadata.file_name, "Kanye West - Good Morning.mp3");
     }
 }
