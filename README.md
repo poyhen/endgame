@@ -39,6 +39,15 @@ settings must be positive integers. `/add` and `/remove` rewrite the
 `allowed_users` array in place, so edit the file by hand only while the bot is
 stopped.
 
+`yt_dlp_domains` is an optional list of hostnames that forces video downloads
+through `yt-dlp`, for example `"yt_dlp_domains": ["media.example.com"]`. Each entry
+matches that hostname and its subdomains, ignoring case; schemes, paths, ports,
+and wildcards are rejected. Matching uses the URL's hostname, so names appearing
+in paths or query strings do not trigger an override. The default empty list
+keeps the existing routing rules. Audio and clip requests always use `yt-dlp`.
+Restart the bot after changing this setting. Keep private domain overrides in
+your ignored `config.json` or the file selected by `CONFIG_FILE`.
+
 ## Usage
 
 - Send one or more URLs in a private message. Every URL becomes a separate,
@@ -99,6 +108,13 @@ and a panicking worker is converted into a visible failed job.
 
 On Ctrl-C, new work is rejected and accepted jobs are drained before the
 Telegram connection closes.
+
+If Telegram returns a temporary server error while initializing a connection
+(for example, `rpc error -500: No workers running caused by invokeWithLayer`),
+the bot retries up to eight connection attempts with increasing delays, capped
+at 30 seconds (two minutes of delays in total). This error means Telegram's
+servers are temporarily unavailable; keep `userbot.session` and try again later
+if the retries are exhausted. Grammers handles salt resets automatically.
 
 ## Verification
 

@@ -8,6 +8,11 @@ pub struct DownloadLimits {
     pub job_timeout: Duration,
 }
 
+pub struct DownloadSettings {
+    pub limits: DownloadLimits,
+    pub yt_dlp_domains: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownloadRequest {
     pub url: String,

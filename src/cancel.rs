@@ -61,18 +61,12 @@ impl CancellationToken {
 mod tests {
     use std::future::Future;
     use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
     use tokio::sync::Barrier;
     use tokio::time::{Duration, timeout};
 
     use super::*;
-
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
 
     #[test]
     fn cancel_is_shared_and_idempotent() {
@@ -132,8 +126,7 @@ mod tests {
     fn waiter_completes_after_being_registered_then_cancelled() {
         let token = CancellationToken::new();
         let mut future = Box::pin(token.cancelled());
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
 

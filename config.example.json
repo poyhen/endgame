@@ -1,6 +1,7 @@
 {
   "superusers": [123456789],
   "allowed_users": [123456789, 987654321],
+  "yt_dlp_domains": [],
   "download_concurrency": 2,
   "download_queue_capacity": 20,
   "max_upload_size_mb": 1900,

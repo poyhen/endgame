@@ -11,7 +11,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::cancel::CancellationToken;
 use crate::jobs::progress::{JobPhase, JobProgress};
 use crate::media::pipeline;
-use crate::media::request::{DownloadLimits, DownloadOutcome, DownloadRequest};
+use crate::media::request::{DownloadOutcome, DownloadRequest, DownloadSettings};
 
 const STATUS_HISTORY_LIMIT: usize = 4_096;
 
@@ -50,7 +50,7 @@ struct SharedQueue {
     changed: Notify,
     concurrency: usize,
     capacity: usize,
-    limits: DownloadLimits,
+    settings: DownloadSettings,
     next_id: AtomicU64,
 }
 
@@ -98,7 +98,7 @@ impl DownloadQueue {
         client: Client,
         concurrency: usize,
         capacity: usize,
-        limits: DownloadLimits,
+        settings: DownloadSettings,
     ) -> Self {
         assert!(concurrency > 0, "download concurrency must be positive");
         assert!(capacity > 0, "download queue capacity must be positive");
@@ -114,7 +114,7 @@ impl DownloadQueue {
             changed: Notify::new(),
             concurrency,
             capacity,
-            limits,
+            settings,
             next_id: AtomicU64::new(1),
         });
         let runner_shared = Arc::clone(&shared);
@@ -377,11 +377,11 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
             };
             let client = client.clone();
             let job_shared = Arc::clone(&shared);
-            let limits = shared.limits;
+            let limits = shared.settings.limits;
             tasks.spawn(async move {
                 let _active_guard = ActiveJobGuard {
                     id: job.id,
-                    shared: job_shared,
+                    shared: Arc::clone(&job_shared),
                 };
                 let result_progress = job.progress.clone();
                 let cancellation = job.cancellation.clone();
@@ -398,7 +398,7 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
                             job.request,
                             &cancellation,
                             &worker_progress,
-                            limits,
+                            &job_shared.settings,
                         )
                         .await
                     }

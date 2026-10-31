@@ -11,7 +11,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grammers_client::client::UpdatesConfiguration;
+use grammers_client::client::{ClientConfiguration, UpdatesConfiguration};
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
@@ -23,7 +23,7 @@ use tokio::task::JoinSet;
 use commands::{MessageAction, classify_message};
 use config::Config;
 use jobs::DownloadQueue;
-use media::request::DownloadLimits;
+use media::request::{DownloadLimits, DownloadSettings};
 use telegram::allowed_users::AllowedUsers;
 
 const SESSION_FILE: &str = "userbot.session";
@@ -47,24 +47,33 @@ async fn main() -> AnyResult<()> {
         handle,
         updates,
     } = SenderPool::new(Arc::clone(&session), cfg.api_id);
-    let client = Client::new(handle.clone());
+    let client = Client::with_configuration(
+        handle.clone(),
+        ClientConfiguration {
+            retry_policy: Box::new(telegram::retry::ConnectionRetryPolicy::default()),
+            ..Default::default()
+        },
+    );
     let _pool_task = tokio::spawn(runner.run());
 
     telegram::auth::ensure_authorized(&client, &cfg.api_hash).await?;
 
     log::info!("Userbot is running");
 
-    let download_limits = DownloadLimits {
-        max_upload_bytes: (cfg.max_upload_size_mb as u64).saturating_mul(1024 * 1024),
-        command_timeout: Duration::from_secs(cfg.command_timeout_secs as u64),
-        upload_timeout: Duration::from_secs(cfg.upload_timeout_secs as u64),
-        job_timeout: Duration::from_secs(cfg.job_timeout_secs as u64),
+    let download_settings = DownloadSettings {
+        limits: DownloadLimits {
+            max_upload_bytes: (cfg.max_upload_size_mb as u64).saturating_mul(1024 * 1024),
+            command_timeout: Duration::from_secs(cfg.command_timeout_secs as u64),
+            upload_timeout: Duration::from_secs(cfg.upload_timeout_secs as u64),
+            job_timeout: Duration::from_secs(cfg.job_timeout_secs as u64),
+        },
+        yt_dlp_domains: cfg.yt_dlp_domains,
     };
     let download_queue = DownloadQueue::new(
         client.clone(),
         cfg.download_concurrency,
         cfg.download_queue_capacity,
-        download_limits,
+        download_settings,
     );
     let download_queue_handle = download_queue.handle();
     log::info!(

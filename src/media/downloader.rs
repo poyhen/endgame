@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use tokio::process::Command;
+use url::Url;
 
 use crate::media::request::{DownloadLimits, DownloadMode};
 
@@ -21,9 +22,10 @@ pub fn build(
     cookie_file: &Path,
     workspace: &Path,
     limits: DownloadLimits,
+    yt_dlp_domains: &[String],
 ) -> DownloadCommand {
-    let use_yt_dlp =
-        matches!(mode, DownloadMode::Audio | DownloadMode::Clip(_)) || should_use_yt_dlp(url);
+    let use_yt_dlp = matches!(mode, DownloadMode::Audio | DownloadMode::Clip(_))
+        || should_use_yt_dlp(url, yt_dlp_domains);
     let program = if use_yt_dlp { "yt-dlp" } else { "gallery-dl" };
     let mut command = Command::new(program);
 
@@ -125,7 +127,10 @@ fn format_clip_timestamp(timestamp: Duration) -> String {
     formatted
 }
 
-fn should_use_yt_dlp(url: &str) -> bool {
+fn should_use_yt_dlp(url: &str, yt_dlp_domains: &[String]) -> bool {
+    if matches_yt_dlp_domain(url, yt_dlp_domains) {
+        return true;
+    }
     [
         "youtube.com/",
         "youtu.be/",
@@ -138,6 +143,29 @@ fn should_use_yt_dlp(url: &str) -> bool {
     ]
     .iter()
     .any(|domain| url.contains(domain))
+}
+
+fn matches_yt_dlp_domain(url: &str, domains: &[String]) -> bool {
+    if domains.is_empty() {
+        return false;
+    }
+    let Ok(url) = Url::parse(url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    domains.iter().any(|domain| {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        host == domain
+            || host
+                .strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 pub(crate) fn video_format_selector(max_height: u32) -> String {
@@ -208,9 +236,13 @@ mod tests {
                 Path::new("instacookies.txt"),
                 Path::new("/tmp/endgame-test"),
                 limits(),
+                &[],
             );
 
-            assert_eq!(download.program, "yt-dlp", "unexpected downloader for {url}");
+            assert_eq!(
+                download.program, "yt-dlp",
+                "unexpected downloader for {url}"
+            );
             assert!(download.reports_progress);
         }
     }
@@ -228,6 +260,7 @@ mod tests {
             Path::new("cookies.txt"),
             Path::new("/tmp/endgame-test"),
             limits(),
+            &[],
         );
         let args = arguments(&download);
 
@@ -255,6 +288,7 @@ mod tests {
             Path::new("cookies.txt"),
             Path::new("/tmp/endgame-test"),
             limits(),
+            &[],
         );
         let clip_args = arguments(&clip);
         assert!(clip_args.iter().any(|argument| argument == DEFAULT_FORMAT));
@@ -270,11 +304,101 @@ mod tests {
             Path::new("cookies.txt"),
             Path::new("/tmp/endgame-test"),
             limits(),
+            &[],
         );
         assert!(
             arguments(&full_video)
                 .iter()
                 .any(|argument| argument.contains("filesize<"))
         );
+    }
+
+    #[test]
+    fn configured_domains_force_yt_dlp_for_video_requests() {
+        let domains = vec![
+            "MEDIA.EXAMPLE.COM.".to_string(),
+            "video.example.net".to_string(),
+        ];
+        for url in [
+            "https://media.example.com/video",
+            "https://www.media.example.com/video",
+            "http://cdn.media.example.com:8080/video?quality=best",
+            "https://MEDIA.EXAMPLE.COM./video",
+            "https://user:password@media.example.com/video",
+            "https://video.example.net/video",
+        ] {
+            let download = build(
+                url,
+                &DownloadMode::Video {
+                    max_height: Some(720),
+                },
+                Path::new("cookies.txt"),
+                Path::new("/tmp/endgame-test"),
+                limits(),
+                &domains,
+            );
+
+            assert_eq!(
+                download.program, "yt-dlp",
+                "unexpected downloader for {url}"
+            );
+            assert!(download.reports_progress);
+            let args = arguments(&download);
+            assert!(
+                args.iter()
+                    .any(|argument| argument == &video_format_selector(720))
+            );
+            assert_eq!(args.last().unwrap(), url);
+        }
+    }
+
+    #[test]
+    fn configured_domains_do_not_match_other_hosts_or_url_contents() {
+        let domains = vec!["media.example.com".to_string()];
+        for url in [
+            "https://notmedia.example.com/video",
+            "https://media.example.com.other.example/video",
+            "https://other.example/media.example.com/video",
+            "https://other.example/?url=https://media.example.com/video",
+            "https://media.example.com@other.example/video",
+            "https://other.example/#media.example.com",
+            "ftp://media.example.com/video",
+            "not a URL",
+        ] {
+            let download = build(
+                url,
+                &DownloadMode::Video { max_height: None },
+                Path::new("cookies.txt"),
+                Path::new("/tmp/endgame-test"),
+                limits(),
+                &domains,
+            );
+
+            assert_eq!(
+                download.program, "gallery-dl",
+                "unexpected downloader for {url}"
+            );
+            assert!(!download.reports_progress);
+        }
+    }
+
+    #[test]
+    fn empty_domain_allowlist_keeps_default_routing() {
+        for (url, program) in [
+            ("https://media.example.com/video", "gallery-dl"),
+            ("https://youtube.com/watch?v=example", "yt-dlp"),
+            ("https://tiktok.com/@example/video/123", "yt-dlp"),
+            ("https://instagram.com/p/example/", "gallery-dl"),
+        ] {
+            let download = build(
+                url,
+                &DownloadMode::Video { max_height: None },
+                Path::new("cookies.txt"),
+                Path::new("/tmp/endgame-test"),
+                limits(),
+                &[],
+            );
+            assert_eq!(download.program, program, "unexpected downloader for {url}");
+        }
     }
 }

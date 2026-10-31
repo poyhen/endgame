@@ -15,7 +15,7 @@ use crate::media::delivery::{
 };
 use crate::media::downloader;
 use crate::media::progress::read_download;
-use crate::media::request::{DownloadLimits, DownloadOutcome, DownloadRequest};
+use crate::media::request::{DownloadOutcome, DownloadRequest, DownloadSettings};
 use crate::media::workspace::JobWorkspace;
 
 enum CommandProgress {
@@ -160,7 +160,7 @@ pub async fn download_and_upload(
     request: DownloadRequest,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    limits: DownloadLimits,
+    settings: &DownloadSettings,
 ) -> DownloadOutcome {
     let workspace = match JobWorkspace::create(progress.id()).await {
         Ok(workspace) => workspace,
@@ -177,7 +177,7 @@ pub async fn download_and_upload(
         request,
         cancellation,
         progress,
-        limits,
+        settings,
         workspace.path(),
     )
     .await;
@@ -191,9 +191,10 @@ async fn download_and_upload_in_workspace(
     request: DownloadRequest,
     cancellation: &CancellationToken,
     progress: &JobProgress,
-    limits: DownloadLimits,
+    settings: &DownloadSettings,
     workspace: &Path,
 ) -> DownloadOutcome {
+    let limits = settings.limits;
     if cancellation.is_cancelled() {
         return DownloadOutcome::Cancelled;
     }
@@ -213,7 +214,14 @@ async fn download_and_upload_in_workspace(
     } else {
         Path::new("cookies.txt")
     };
-    let download = downloader::build(&url, &mode, cookie_file, workspace, limits);
+    let download = downloader::build(
+        &url,
+        &mode,
+        cookie_file,
+        workspace,
+        limits,
+        &settings.yt_dlp_domains,
+    );
     let downloader_name = download.program;
     let use_yt_dlp = download.reports_progress;
     log::info!("{info} | Using {downloader_name} for URL: {url}");

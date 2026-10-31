@@ -11,6 +11,7 @@ pub struct Config {
     pub allowed_users: Vec<i64>,
     pub config_path: PathBuf,
     pub url_pattern: Regex,
+    pub yt_dlp_domains: Vec<String>,
     pub download_concurrency: usize,
     pub download_queue_capacity: usize,
     pub max_upload_size_mb: usize,
@@ -24,6 +25,7 @@ pub struct Config {
 struct FileConfig {
     superusers: Vec<i64>,
     allowed_users: Vec<i64>,
+    yt_dlp_domains: Vec<String>,
     download_concurrency: usize,
     download_queue_capacity: usize,
     max_upload_size_mb: usize,
@@ -37,6 +39,7 @@ impl Default for FileConfig {
         Self {
             superusers: Vec::new(),
             allowed_users: Vec::new(),
+            yt_dlp_domains: Vec::new(),
             download_concurrency: 2,
             download_queue_capacity: 20,
             max_upload_size_mb: 1900,
@@ -68,6 +71,24 @@ impl FileConfig {
         }
         if self.superusers.is_empty() && self.allowed_users.is_empty() {
             anyhow::bail!("config must list at least one superuser or allowed user");
+        }
+        for (index, domain) in self.yt_dlp_domains.iter().enumerate() {
+            let domain = domain.strip_suffix('.').unwrap_or(domain);
+            if domain.len() > 253
+                || domain.split('.').any(|label| {
+                    label.is_empty()
+                        || label.len() > 63
+                        || label.starts_with('-')
+                        || label.ends_with('-')
+                        || !label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            {
+                anyhow::bail!(
+                    "yt_dlp_domains[{index}] must be a hostname without a scheme, path, port, or wildcard"
+                );
+            }
         }
         Ok(())
     }
@@ -112,6 +133,7 @@ impl Config {
             allowed_users: file_config.allowed_users,
             config_path,
             url_pattern,
+            yt_dlp_domains: file_config.yt_dlp_domains,
             download_concurrency: file_config.download_concurrency,
             download_queue_capacity: file_config.download_queue_capacity,
             max_upload_size_mb: file_config.max_upload_size_mb,
@@ -151,6 +173,7 @@ mod tests {
         let cfg: FileConfig = serde_json::from_str(r#"{"superusers": [1]}"#).unwrap();
         assert_eq!(cfg.superusers, vec![1]);
         assert!(cfg.allowed_users.is_empty());
+        assert!(cfg.yt_dlp_domains.is_empty());
         assert_eq!(cfg.download_concurrency, 2);
         assert_eq!(cfg.download_queue_capacity, 20);
         assert_eq!(cfg.max_upload_size_mb, 1900);
@@ -162,14 +185,11 @@ mod tests {
 
     #[test]
     fn rejects_invalid_config_values() {
-        let zero: FileConfig = serde_json::from_str(
-            r#"{"superusers": [1], "download_queue_capacity": 0}"#,
-        )
-        .unwrap();
+        let zero: FileConfig =
+            serde_json::from_str(r#"{"superusers": [1], "download_queue_capacity": 0}"#).unwrap();
         assert!(zero.validate().is_err());
 
-        let negative_id: FileConfig =
-            serde_json::from_str(r#"{"allowed_users": [-1]}"#).unwrap();
+        let negative_id: FileConfig = serde_json::from_str(r#"{"allowed_users": [-1]}"#).unwrap();
         assert!(negative_id.validate().is_err());
 
         let nobody: FileConfig = serde_json::from_str("{}").unwrap();
@@ -178,22 +198,50 @@ mod tests {
 
     #[test]
     fn rejects_unknown_config_keys() {
-        let error = serde_json::from_str::<FileConfig>(
-            r#"{"superusers": [1], "download_concurency": 4}"#,
-        )
-        .err()
-        .expect("a misspelled config key must be rejected");
+        let error =
+            serde_json::from_str::<FileConfig>(r#"{"superusers": [1], "download_concurency": 4}"#)
+                .err()
+                .expect("a misspelled config key must be rejected");
 
         assert!(
-            error.to_string().contains("unknown field `download_concurency`"),
+            error
+                .to_string()
+                .contains("unknown field `download_concurency`"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
+    fn validates_downloader_domain_allowlist() {
+        let mut cfg = FileConfig {
+            superusers: vec![1],
+            yt_dlp_domains: vec!["media.example.com".into(), "VIDEO.EXAMPLE.NET.".into()],
+            ..FileConfig::default()
+        };
+        cfg.validate().unwrap();
+
+        for domain in [
+            "",
+            " ",
+            "https://example.com",
+            "example.com/video",
+            "example.com:443",
+            "*.example.com",
+            "user@example.com",
+            "example..com",
+            "example.com..",
+            "-example.com",
+            "example-.com",
+        ] {
+            cfg.yt_dlp_domains = vec![domain.into()];
+            let error = cfg.validate().unwrap_err();
+            assert!(error.to_string().contains("yt_dlp_domains[0]"));
+        }
+    }
+
+    #[test]
     fn committed_example_config_stays_valid() {
-        let cfg: FileConfig =
-            serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        let cfg: FileConfig = serde_json::from_str(include_str!("../config.example.json")).unwrap();
         cfg.validate().unwrap();
     }
 }
