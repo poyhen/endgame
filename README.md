@@ -48,6 +48,66 @@ keeps the existing routing rules. Audio and clip requests always use `yt-dlp`.
 Restart the bot after changing this setting. Keep private domain overrides in
 your ignored `config.json` or the file selected by `CONFIG_FILE`.
 
+## Running as a system service
+
+On Linux with systemd, `deploy/endgame.service` runs the bot as the dedicated
+`endgame` user. Its working directory is `/var/lib/endgame`, which holds the
+editable `config.json`, Telegram session and cookie files. The service reads
+`API_ID` and `API_HASH` from `/etc/endgame/environment`; keep this file owned
+by root with mode `0600` and do not put credentials in the Nix store or Git.
+
+For a first installation, run these commands as root from the Git checkout:
+
+```sh
+useradd --system --user-group --no-create-home \
+  --home-dir /var/lib/endgame --shell /usr/sbin/nologin endgame
+install -d -m 0700 -o endgame -g endgame /var/lib/endgame
+install -d -m 0700 -o root -g root /etc/endgame
+install -d -m 0755 /opt/endgame
+nix build --extra-experimental-features 'nix-command flakes' \
+  --out-link /opt/endgame/current .#endgame
+install -m 0644 deploy/endgame.service /etc/systemd/system/endgame.service
+```
+
+Create `/etc/endgame/environment` with mode `0600`, containing `API_ID=...` and
+`API_HASH=...` on separate lines. Stop any existing bot instance before copying
+`config.json`, `userbot.session` and its sidecar files, and any cookie files to
+`/var/lib/endgame`. Give those files to `endgame:endgame` with mode `0600`.
+Copy the session and its sidecars together while the old process is stopped;
+otherwise its latest login state can be lost. Keep the original files as a
+backup until the service has started successfully.
+
+```sh
+systemctl daemon-reload
+systemctl enable --now endgame.service
+systemctl status endgame.service
+journalctl -u endgame.service -f
+```
+
+The service expects an already authorized Telegram session because it has no
+interactive terminal. If login is needed, stop the service and run the same
+binary interactively under the service account using the service environment:
+
+```sh
+systemctl stop endgame.service
+systemd-run --wait --pty --collect --property=User=endgame \
+  --property=Group=endgame --property=WorkingDirectory=/var/lib/endgame \
+  --property=EnvironmentFile=/etc/endgame/environment \
+  /opt/endgame/current/bin/endgame
+```
+
+After signing in, stop the interactive bot with Ctrl-C and start the service.
+The service sends the same signal on shutdown and allows up to two minutes for
+accepted jobs to drain; longer work may be interrupted when that timeout ends.
+
+To deploy an update, run the following as root from the checkout. The recipe
+pulls the current branch, rebuilds the rooted package, installs the unit, and
+restarts the service. Enter `nix develop` first if `just` is not on your PATH.
+
+```sh
+just update
+```
+
 ## Usage
 
 - Send one or more URLs in a private message. Every URL becomes a separate,
