@@ -11,13 +11,12 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grammers_client::client::{ClientConfiguration, UpdatesConfiguration};
+use grammers_client::sender::{ConnectionParams, UpdatesConfiguration};
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
 use grammers_session::types::PeerKind;
 use regex::Regex;
-use simple_logger::SimpleLogger;
 use tokio::task::JoinSet;
 
 use commands::{MessageAction, classify_message};
@@ -34,11 +33,22 @@ type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sy
 
 #[tokio::main]
 async fn main() -> AnyResult<()> {
-    let _ = SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_ansi(false)
+        .try_init()?;
 
     let cfg = Config::load()?;
+    log::info!(
+        "Telegram connections will use {}",
+        if cfg.telegram_use_ipv6 {
+            "IPv6"
+        } else {
+            "IPv4"
+        }
+    );
 
     let session = Arc::new(SqliteSession::open(SESSION_FILE).await?);
 
@@ -46,14 +56,16 @@ async fn main() -> AnyResult<()> {
         runner,
         handle,
         updates,
-    } = SenderPool::new(Arc::clone(&session), cfg.api_id);
-    let client = Client::with_configuration(
-        handle.clone(),
-        ClientConfiguration {
+    } = SenderPool::with_configuration(
+        Arc::clone(&session),
+        cfg.api_id,
+        ConnectionParams {
+            use_ipv6: cfg.telegram_use_ipv6,
             retry_policy: Box::new(telegram::retry::ConnectionRetryPolicy::default()),
             ..Default::default()
         },
     );
+    let client = Client::new(handle.clone());
     let _pool_task = tokio::spawn(runner.run());
 
     telegram::auth::ensure_authorized(&client, &cfg.api_hash).await?;
@@ -93,13 +105,7 @@ async fn main() -> AnyResult<()> {
     // links sent during downtime, and reprocessing them all at once on startup
     // causes massive download/upload spikes. Only handle links that arrive live.
     let mut updates = client
-        .stream_updates(
-            updates,
-            UpdatesConfiguration {
-                catch_up: false,
-                ..Default::default()
-            },
-        )
+        .stream_updates(updates, UpdatesConfiguration { catch_up: false })
         .await?;
 
     let mut handler_tasks = JoinSet::new();

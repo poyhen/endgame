@@ -12,6 +12,7 @@ pub struct Config {
     pub config_path: PathBuf,
     pub url_pattern: Regex,
     pub yt_dlp_domains: Vec<String>,
+    pub telegram_use_ipv6: bool,
     pub download_concurrency: usize,
     pub download_queue_capacity: usize,
     pub max_upload_size_mb: usize,
@@ -26,6 +27,7 @@ struct FileConfig {
     superusers: Vec<i64>,
     allowed_users: Vec<i64>,
     yt_dlp_domains: Vec<String>,
+    telegram_use_ipv6: bool,
     download_concurrency: usize,
     download_queue_capacity: usize,
     max_upload_size_mb: usize,
@@ -40,6 +42,7 @@ impl Default for FileConfig {
             superusers: Vec::new(),
             allowed_users: Vec::new(),
             yt_dlp_domains: Vec::new(),
+            telegram_use_ipv6: false,
             download_concurrency: 2,
             download_queue_capacity: 20,
             max_upload_size_mb: 1900,
@@ -134,6 +137,7 @@ impl Config {
             config_path,
             url_pattern,
             yt_dlp_domains: file_config.yt_dlp_domains,
+            telegram_use_ipv6: file_config.telegram_use_ipv6,
             download_concurrency: file_config.download_concurrency,
             download_queue_capacity: file_config.download_queue_capacity,
             max_upload_size_mb: file_config.max_upload_size_mb,
@@ -174,12 +178,21 @@ mod tests {
         assert_eq!(cfg.superusers, vec![1]);
         assert!(cfg.allowed_users.is_empty());
         assert!(cfg.yt_dlp_domains.is_empty());
+        assert!(!cfg.telegram_use_ipv6);
         assert_eq!(cfg.download_concurrency, 2);
         assert_eq!(cfg.download_queue_capacity, 20);
         assert_eq!(cfg.max_upload_size_mb, 1900);
         assert_eq!(cfg.command_timeout_secs, 10800);
         assert_eq!(cfg.upload_timeout_secs, 7200);
         assert_eq!(cfg.job_timeout_secs, 21600);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_ipv6_for_hosts_with_a_better_telegram_route() {
+        let cfg: FileConfig =
+            serde_json::from_str(r#"{"superusers": [1], "telegram_use_ipv6": true}"#).unwrap();
+        assert!(cfg.telegram_use_ipv6);
         cfg.validate().unwrap();
     }
 

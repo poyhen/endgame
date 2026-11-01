@@ -14,10 +14,12 @@ use crate::jobs::JobProgress;
 use crate::media::inspect::extract_thumbnail;
 use crate::media::request::{DownloadLimits, DownloadOutcome};
 use crate::media::transcode::prepare_video;
+use crate::telegram::upload::with_retries;
 
 const UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const TELEGRAM_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const UTILITY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const THUMBNAIL_UPLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct DeliveryPlan {
     pub position: (usize, usize),
@@ -115,27 +117,50 @@ async fn upload_file_with_progress(
     position: (usize, usize),
     upload_timeout: Duration,
 ) -> anyhow::Result<Uploaded> {
-    let file = tokio::fs::File::open(path).await?;
-    let total_bytes = file.metadata().await?.len();
+    let total_bytes = tokio::fs::metadata(path).await?.len();
     let size = usize::try_from(total_bytes)
         .map_err(|_| anyhow::anyhow!("file is too large for this platform"))?;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow::anyhow!("upload path has no file name"))?;
-    let mut reader = ProgressReader::new(file, progress.clone(), position, total_bytes);
-
-    let uploaded = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => anyhow::bail!("cancelled"),
-        _ = tokio::time::sleep(upload_timeout) => anyhow::bail!(
-            "Telegram upload timed out after {} seconds",
-            upload_timeout.as_secs()
-        ),
-        result = client.upload_stream(&mut reader, size, name) => result?,
-    };
+    let started = Instant::now();
+    let operation = format!(
+        "Job #{} Telegram upload ({name}, {total_bytes} bytes)",
+        progress.id()
+    );
+    log::info!("{operation} started");
+    let uploaded = with_retries(cancellation, upload_timeout, &operation, || {
+        let name = name.clone();
+        async move {
+            // Every retry opens a fresh stream at byte zero.
+            let file = tokio::fs::File::open(path).await?;
+            let mut reader = ProgressReader::new(file, progress.clone(), position, total_bytes);
+            client.upload_stream(&mut reader, size, name).await
+        }
+    })
+    .await?;
+    log::info!(
+        "{operation} completed after {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     progress.upload_progress(position.0, position.1, total_bytes, total_bytes);
     Ok(uploaded)
+}
+
+async fn upload_thumbnail(
+    client: &Client,
+    path: &Path,
+    cancellation: &CancellationToken,
+    job_id: u64,
+) -> anyhow::Result<Uploaded> {
+    with_retries(
+        cancellation,
+        THUMBNAIL_UPLOAD_TIMEOUT,
+        &format!("Job #{job_id} Telegram thumbnail upload"),
+        || client.upload_file(path),
+    )
+    .await
 }
 
 pub(crate) async fn send_gallery_albums(
@@ -303,9 +328,8 @@ async fn prepare_album_media(
                 h: metadata.height,
             });
         if let Some(thumbnail) = &thumbnail
-            && let Ok(Ok(thumb)) =
-                tokio::time::timeout(TELEGRAM_OPERATION_TIMEOUT, client.upload_file(thumbnail))
-                    .await
+            && let Ok(thumb) =
+                upload_thumbnail(client, thumbnail, cancellation, progress.id()).await
         {
             media = media.thumbnail(thumb);
         }
@@ -360,13 +384,15 @@ pub(crate) async fn send_video(
                 h: metadata.height,
             });
         if let Some(thumbnail) = &thumbnail
-            && let Ok(Ok(thumb)) =
-                tokio::time::timeout(TELEGRAM_OPERATION_TIMEOUT, client.upload_file(thumbnail))
-                    .await
+            && let Ok(thumb) =
+                upload_thumbnail(client, thumbnail, cancellation, progress.id()).await
         {
             input = input.thumbnail(thumb);
         }
-        deliver_media(message, progress, input, delivery.replace_status).await?;
+        if cancellation.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        deliver_media(client, message, progress, input, delivery.replace_status).await?;
         Ok(())
     }
     .await;
@@ -393,6 +419,7 @@ pub(crate) async fn send_image(
     )
     .await?;
     deliver_media(
+        client,
         message,
         progress,
         InputMessage::new().photo(photo),
@@ -420,6 +447,7 @@ pub(crate) async fn send_audio(
     )
     .await?;
     deliver_media(
+        client,
         message,
         progress,
         InputMessage::new().document(audio),
@@ -429,6 +457,7 @@ pub(crate) async fn send_audio(
 }
 
 async fn deliver_media(
+    client: &Client,
     source: &UpdateMessage,
     progress: &JobProgress,
     media: InputMessage,
@@ -446,7 +475,7 @@ async fn deliver_media(
             })??;
         return Ok(());
     }
-    match progress.replace_with_media(media.clone()).await {
+    match progress.replace_with_media(client, media.clone()).await {
         Ok(true) => Ok(()),
         Ok(false) => match timed_fallback_send(source, progress, media).await {
             Ok(_) => {

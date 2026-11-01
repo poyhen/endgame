@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-grammers-client = { git = "https://codeberg.org/Lonami/grammers.git", rev = "bafe16b9d9e8940f5a0d94c7466171b6c754144e" }
-grammers-session = { git = "https://codeberg.org/Lonami/grammers.git", rev = "bafe16b9d9e8940f5a0d94c7466171b6c754144e", features = ["sqlite-storage"] }
+grammers-client = { git = "https://codeberg.org/Lonami/grammers.git", rev = "1e31e73cd9797790905bbea82cd75adcbe6f1242" }
+grammers-session = { git = "https://codeberg.org/Lonami/grammers.git", rev = "1e31e73cd9797790905bbea82cd75adcbe6f1242", features = ["sqlite-storage"] }
 tokio = { version = "1", features = [
   "fs",
   "io-util",
@@ -17,11 +17,8 @@ tokio = { version = "1", features = [
   "time",
 ] }
 log = "0.4"
-simple_logger = { version = "5", default-features = false, features = [
-  "colors",
-  "timestamps",
-] }
-rand = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.10"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

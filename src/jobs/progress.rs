@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use grammers_client::Client;
 use grammers_client::message::{InputMessage, Message as SentMessage};
 use grammers_client::update::Message as UpdateMessage;
 use tokio::sync::Notify;
@@ -135,7 +136,11 @@ impl JobProgress {
         self.set_phase(JobPhase::Completed);
     }
 
-    pub async fn replace_with_media(&self, message: InputMessage) -> anyhow::Result<bool> {
+    pub async fn replace_with_media(
+        &self,
+        client: &Client,
+        message: InputMessage,
+    ) -> anyhow::Result<bool> {
         self.inner.final_media.store(true, Ordering::Release);
         let Some(status) = self.wait_for_status().await else {
             return Ok(false);
@@ -145,9 +150,14 @@ impl JobProgress {
             tokio::time::timeout(STATUS_OPERATION_TIMEOUT, self.inner.edit_lock.lock())
                 .await
                 .map_err(|_| anyhow::anyhow!("timed out waiting for the status edit lock"))?;
-        tokio::time::timeout(STATUS_OPERATION_TIMEOUT, status.edit(message))
-            .await
-            .map_err(|_| anyhow::anyhow!("final status edit timed out"))??;
+        tokio::time::timeout(STATUS_OPERATION_TIMEOUT, async {
+            status.edit(message).await?;
+            // Keep the edit lock and final_media flag through both operations
+            // so a pending progress update cannot restore the old caption.
+            crate::telegram::caption::clear(client, &status).await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("final status edit timed out"))??;
         Ok(true)
     }
 

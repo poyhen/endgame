@@ -7,8 +7,7 @@ use url::Url;
 use crate::media::request::{DownloadLimits, DownloadMode};
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0";
-const DEFAULT_FORMAT: &str =
-    "bestvideo[vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
+const DEFAULT_FORMAT: &str = "bestvideo[ext=mp4][vcodec~='^(avc1|h264)']+bestaudio[ext=m4a]/best[ext=mp4][vcodec~='^(avc1|h264)']/best[ext=mp4]/best";
 
 pub struct DownloadCommand {
     pub command: Command,
@@ -31,12 +30,19 @@ pub fn build(
 
     if use_yt_dlp {
         command
+            .arg("--ignore-config")
             .arg("-o")
             .arg(workspace.join("media.%(ext)s"))
             .arg("--cookies")
             .arg(cookie_file)
-            .arg("--user-agent")
-            .arg(USER_AGENT)
+            .arg("--socket-timeout")
+            .arg("30")
+            .arg("--retries")
+            .arg("5")
+            .arg("--fragment-retries")
+            .arg("5")
+            .arg("--concurrent-fragments")
+            .arg("4")
             .arg("--newline")
             .arg("--progress-template")
             .arg("download:download:%(progress._percent_str)s");
@@ -170,7 +176,7 @@ fn matches_yt_dlp_domain(url: &str, domains: &[String]) -> bool {
 
 pub(crate) fn video_format_selector(max_height: u32) -> String {
     format!(
-        "bestvideo[height<={max_height}][vcodec!*=av01][vcodec!*=vp9][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_height}][ext=mp4]/best[height<={max_height}]"
+        "bestvideo[height<={max_height}][ext=mp4][vcodec~='^(avc1|h264)']+bestaudio[ext=m4a]/best[height<={max_height}][ext=mp4][vcodec~='^(avc1|h264)']/best[height<={max_height}][ext=mp4]/best[height<={max_height}]"
     )
 }
 
@@ -213,7 +219,7 @@ mod tests {
 
     #[test]
     fn quality_selector_caps_every_fallback() {
-        assert_eq!(video_format_selector(720).matches("height<=720").count(), 3);
+        assert_eq!(video_format_selector(720).matches("height<=720").count(), 4);
     }
 
     #[test]

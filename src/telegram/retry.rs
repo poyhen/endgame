@@ -2,7 +2,7 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use grammers_client::InvocationError;
-use grammers_client::client::{AutoSleep, RetryContext, RetryPolicy};
+use grammers_client::sender::{AutoSleep, RetryContext, RetryPolicy};
 use grammers_client::tl::{self, Identifiable};
 
 const MAX_ATTEMPTS: u32 = 8;

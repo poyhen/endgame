@@ -10,12 +10,35 @@
       ];
 
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      pkgsFor =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [
+            (_final: prev: {
+              # Keep extractor fixes current even when nixos-unstable lags a release.
+              yt-dlp =
+                if prev.lib.versionOlder prev.yt-dlp.version "2026.10.26" then
+                  prev.yt-dlp.overridePythonAttrs (_old: rec {
+                    version = "2026.10.26";
+                    src = prev.fetchFromGitHub {
+                      owner = "yt-dlp";
+                      repo = "yt-dlp";
+                      tag = version;
+                      hash = "sha256-0gX99Q45+1L4eH0YK0942DVTq5Wwscq3Qkj+N/EjHek=";
+                    };
+                  })
+                else
+                  prev.yt-dlp;
+            })
+          ];
+        };
     in
     {
       packages = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor system;
         in
         rec {
           default = endgame;
@@ -34,7 +57,7 @@
 
             cargoLock = {
               lockFile = ./Cargo.lock;
-              outputHashes."grammers-client-0.9.0" = "sha256-ByVea3aFAWB2EQqUemU2P1BeMyFo50EPKJuur1NN8AU=";
+              outputHashes."grammers-client-0.11.0" = "sha256-h6yio6phpmayaWAI4WjMqjSP7guq48MazUaQdsjPSxI=";
             };
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -61,7 +84,7 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor system;
         in
         {
           default = pkgs.mkShell {

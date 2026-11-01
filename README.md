@@ -17,6 +17,14 @@ nix develop
 cargo run
 ```
 
+The flake provides yt-dlp 2026.10.26 or newer, overriding older nixpkgs versions
+while allowing future nixpkgs updates to supply a newer release. Both the
+development shell and deployed service use the same version.
+Grammers is pinned to an upstream 0.11.0 revision containing the October 2026
+connection buffer fixes. Refresh `Cargo.lock` with `cargo update` when updating
+dependencies; changing the Grammers revision also requires updating its source
+hash in `flake.nix`.
+
 ## Configuration
 
 Telegram API credentials come from environment variables; everything else lives
@@ -47,6 +55,10 @@ in paths or query strings do not trigger an override. The default empty list
 keeps the existing routing rules. Audio and clip requests always use `yt-dlp`.
 Restart the bot after changing this setting. Keep private domain overrides in
 your ignored `config.json` or the file selected by `CONFIG_FILE`.
+
+`telegram_use_ipv6` defaults to `false`. Set it to `true` on a host with working
+IPv6 when its IPv4 route to Telegram is slow or frequently disconnects. Restart
+the service after changing it. The selected address family is logged at startup.
 
 ## Running as a system service
 
@@ -150,9 +162,9 @@ failed status edits are retried without blocking the media worker. `/status`
 shows each caller's active job phase and how long it has been in that phase.
 
 For a single image, video, or audio result, that status message is edited into
-the final media message instead of sending a second message. For galleries, the
-album is sent and the temporary status is deleted. Failures and cancellations
-remain visible by editing the same status message.
+the final media message and its progress caption is explicitly cleared. For
+galleries, the album is sent and the temporary status is deleted. Failures and
+cancellations remain visible by editing the same status message.
 
 Videos that are not already MP4/H.264, or that exceed `MAX_UPLOAD_SIZE_MB`, are
 converted to MP4/H.264/AAC with a streaming-friendly layout. Temporary media,
@@ -161,10 +173,33 @@ For YouTube, the downloader first prefers an H.264 MP4 format estimated to fit
 under the upload ceiling, which avoids needless multi-hour transcodes when a
 slightly lower compatible format is available. Playlist expansion is disabled;
 each submitted URL remains one job.
+Other video sources also prefer H.264 MP4 when available, avoiding unnecessary
+transcoding of codecs such as VP9 (including its `vp09` format label).
 
 External commands, uploads, and whole jobs are watched by configurable
 deadlines. Logs include job phase transitions plus command PID and elapsed time,
 and a panicking worker is converted into a visible failed job.
+
+Uploads restart from byte zero after temporary Telegram connection failures or
+server errors, with at most three attempts and a single overall upload deadline.
+Cancellation interrupts both the upload and retry delays. Optional thumbnail
+uploads have a separate 15-second limit so they cannot hold up an otherwise ready
+video for minutes. Completed uploads log their byte count and elapsed time.
+yt-dlp uses a 30-second socket timeout, bounded retries, and four concurrent
+fragments for supported DASH/HLS downloads. Host-level yt-dlp configuration files
+are ignored, and yt-dlp chooses its extractor-specific user agent.
+
+When diagnosing a slow job, compare the downloader's `ended after` log with the
+Telegram upload's start and completion times. `request error: read 0 bytes` means
+Telegram's connection closed; it does not mean yt-dlp downloaded an empty file.
+Set `RUST_LOG` in the service environment to adjust logging, for example
+`RUST_LOG=info,grammers_mtsender=debug` for connection diagnostics.
+
+For manual Telegram checks using a copy of the bot's session, stop the service
+first, finish and close the diagnostic client, then restart the service last.
+[Telegram delivers updates to the last active connection](https://core.telegram.org/api/updates#subscribing-to-updates)
+for an authorization key. A diagnostic client can take over live updates even
+while the service stays connected; restarting the service restores its subscription.
 
 On Ctrl-C, new work is rejected and accepted jobs are drained before the
 Telegram connection closes.
