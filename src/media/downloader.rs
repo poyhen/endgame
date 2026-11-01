@@ -26,69 +26,18 @@ pub fn build(
     let use_yt_dlp = matches!(mode, DownloadMode::Audio | DownloadMode::Clip(_))
         || should_use_yt_dlp(url, yt_dlp_domains);
     let program = if use_yt_dlp { "yt-dlp" } else { "gallery-dl" };
-    let mut command = Command::new(program);
-
-    if use_yt_dlp {
+    let command = if use_yt_dlp {
+        let mut command = yt_dlp_command();
         command
-            .arg("--ignore-config")
             .arg("-o")
             .arg(workspace.join("media.%(ext)s"))
             .arg("--cookies")
-            .arg(cookie_file)
-            .arg("--socket-timeout")
-            .arg("30")
-            .arg("--retries")
-            .arg("5")
-            .arg("--fragment-retries")
-            .arg("5")
-            .arg("--concurrent-fragments")
-            .arg("4")
-            .arg("--newline")
-            .arg("--progress-template")
-            .arg("download:download:%(progress._percent_str)s");
-
-        match mode {
-            DownloadMode::Audio => {
-                command
-                    .arg("--extract-audio")
-                    .arg("--audio-format")
-                    .arg("mp3")
-                    .arg("--audio-quality")
-                    .arg("0");
-            }
-            DownloadMode::Clip(range) => {
-                // Full-source filesize estimates would unnecessarily downgrade a short
-                // clip from a long video. Enforce the upload limit on the finished clip.
-                command
-                    .arg("-f")
-                    .arg(unrestricted_video_format(url))
-                    .arg("--download-sections")
-                    .arg(format!(
-                        "*{}-{}",
-                        format_clip_timestamp(range.start()),
-                        format_clip_timestamp(range.end())
-                    ))
-                    .arg("--force-keyframes-at-cuts");
-            }
-            DownloadMode::Video { max_height }
-                if url.contains("youtube.com/") || url.contains("youtu.be/") =>
-            {
-                command.arg("-f").arg(youtube_format_selector(
-                    limits.max_upload_bytes,
-                    *max_height,
-                ));
-            }
-            DownloadMode::Video {
-                max_height: Some(height),
-            } => {
-                command.arg("-f").arg(video_format_selector(*height));
-            }
-            DownloadMode::Video { max_height: None } => {
-                command.arg("-f").arg(unrestricted_video_format(url));
-            }
-        }
-        command.arg("--no-playlist").arg(url);
+            .arg(cookie_file);
+        configure_yt_dlp(&mut command, url, mode, limits);
+        command.arg(url);
+        command
     } else {
+        let mut command = Command::new(program);
         command
             .arg("--cookies")
             .arg(cookie_file)
@@ -97,12 +46,80 @@ pub fn build(
             .arg("-D")
             .arg(workspace)
             .arg(url);
-    }
+        command
+    };
     DownloadCommand {
         command,
         program,
         reports_progress: use_yt_dlp,
     }
+}
+
+pub(crate) fn yt_dlp_command() -> Command {
+    let mut command = Command::new("yt-dlp");
+    command
+        .arg("--ignore-config")
+        .arg("--socket-timeout")
+        .arg("30")
+        .arg("--retries")
+        .arg("5")
+        .arg("--fragment-retries")
+        .arg("5")
+        .arg("--concurrent-fragments")
+        .arg("4")
+        .arg("--newline")
+        .arg("--progress-template")
+        .arg("download:download:%(progress._percent_str)s");
+    command
+}
+
+pub(crate) fn configure_yt_dlp(
+    command: &mut Command,
+    url: &str,
+    mode: &DownloadMode,
+    limits: DownloadLimits,
+) {
+    match mode {
+        DownloadMode::Audio => {
+            command
+                .arg("--extract-audio")
+                .arg("--audio-format")
+                .arg("mp3")
+                .arg("--audio-quality")
+                .arg("0");
+        }
+        DownloadMode::Clip(range) => {
+            // Full-source filesize estimates would unnecessarily downgrade a short
+            // clip from a long video. Enforce the upload limit on the finished clip.
+            command
+                .arg("-f")
+                .arg(unrestricted_video_format(url))
+                .arg("--download-sections")
+                .arg(format!(
+                    "*{}-{}",
+                    format_clip_timestamp(range.start()),
+                    format_clip_timestamp(range.end())
+                ))
+                .arg("--force-keyframes-at-cuts");
+        }
+        DownloadMode::Video { max_height }
+            if url.contains("youtube.com/") || url.contains("youtu.be/") =>
+        {
+            command.arg("-f").arg(youtube_format_selector(
+                limits.max_upload_bytes,
+                *max_height,
+            ));
+        }
+        DownloadMode::Video {
+            max_height: Some(height),
+        } => {
+            command.arg("-f").arg(video_format_selector(*height));
+        }
+        DownloadMode::Video { max_height: None } => {
+            command.arg("-f").arg(unrestricted_video_format(url));
+        }
+    }
+    command.arg("--no-playlist");
 }
 
 fn unrestricted_video_format(url: &str) -> &'static str {

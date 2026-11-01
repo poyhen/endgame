@@ -157,6 +157,14 @@ just update
   The cookie message is deleted and the local file is written with owner-only
   permissions on Unix systems.
 
+If Instagram rejects a post with an authentication error, the bot retries it
+without saved cookies using Instagram's public page. This fallback supports
+photos, videos, and mixed carousels, preserving carousel order and album delivery.
+Private or restricted posts still need working account cookies. If Instagram
+requires an account checkpoint, open Instagram in your browser, complete the
+verification, and export fresh cookies with `/insta`. A generic `400 Bad Request`
+from the media-info API can indicate this checkpoint even before the cookies expire.
+
 Each accepted job maintains one status message as it moves through queued,
 downloading, inspection, transcoding, thumbnail preparation, uploading,
 finalization, and a terminal state. yt-dlp downloads and transcodes report
@@ -182,6 +190,10 @@ For a single image, video, or audio result, that status message is edited into
 the final media message and its progress caption is explicitly cleared. For
 galleries, the album is sent and the temporary status is deleted. Failures and
 cancellations remain visible by editing the same status message.
+
+Photos in formats Telegram cannot send as photos, including WebP, are converted
+to JPEG before upload. This applies to both single photos and album items;
+compatible JPEG and PNG files keep their original bytes.
 
 Videos that are not already MP4/H.264, or that exceed `MAX_UPLOAD_SIZE_MB`, are
 converted to MP4/H.264/AAC with a streaming-friendly layout. Temporary media,

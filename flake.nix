@@ -61,6 +61,7 @@
             };
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeCheckInputs = [ pkgs.ffmpeg ];
             postInstall = ''
               wrapProgram "$out/bin/endgame" --prefix PATH : ${
                 pkgs.lib.makeBinPath (

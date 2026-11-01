@@ -13,10 +13,12 @@ use crate::media::command::{self, CommandOutcome};
 use crate::media::delivery::{
     DeliveryPlan, media_kind, send_audio, send_gallery_albums, send_image, send_video,
 };
-use crate::media::downloader;
 use crate::media::progress::read_download;
-use crate::media::request::{DownloadOutcome, DownloadRequest, DownloadSettings};
+use crate::media::request::{
+    DownloadLimits, DownloadMode, DownloadOutcome, DownloadRequest, DownloadSettings,
+};
 use crate::media::workspace::JobWorkspace;
+use crate::media::{downloader, instagram};
 
 enum CommandProgress {
     Download(JobProgress),
@@ -117,6 +119,58 @@ async fn run_command(
                 None => command::read_bounded(&mut stdout).await,
             }
         },
+    )
+    .await
+}
+
+async fn download_public_instagram(
+    url: &str,
+    mode: &DownloadMode,
+    workspace: &Path,
+    limits: DownloadLimits,
+    cancellation: &CancellationToken,
+    progress: &JobProgress,
+) -> CommandOutcome {
+    let source = workspace.join("instagram-source.jsonl");
+    let outcome = run_command(
+        instagram::metadata_command(url, &source),
+        cancellation,
+        limits.command_timeout,
+        progress.id(),
+        None,
+    )
+    .await;
+    if !matches!(outcome, CommandOutcome::Finished { success: true, .. }) {
+        return outcome;
+    }
+
+    let metadata_path = workspace.join("instagram-public.info.json");
+    let prepare = async {
+        let source = tokio::fs::read_to_string(source).await?;
+        let metadata = instagram::prepare_metadata(&source, mode)?;
+        tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata)?).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    if let Err(error) = prepare.await {
+        return CommandOutcome::Finished {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("could not prepare public Instagram media: {error:#}"),
+        };
+    }
+
+    run_command(
+        instagram::download_command(
+            url,
+            mode,
+            limits,
+            &metadata_path,
+            &workspace.join("instagram-public"),
+        ),
+        cancellation,
+        limits.command_timeout,
+        progress.id(),
+        Some(CommandProgress::Download(progress.clone())),
     )
     .await
 }
@@ -222,19 +276,44 @@ async fn download_and_upload_in_workspace(
         limits,
         &settings.yt_dlp_domains,
     );
-    let downloader_name = download.program;
-    let use_yt_dlp = download.reports_progress;
+    let mut downloader_name = download.program;
+    let mut gallery_delivery = !download.reports_progress;
+    let mut download_directory = workspace.to_path_buf();
     log::info!("{info} | Using {downloader_name} for URL: {url}");
 
-    let (success, stdout, stderr) = match run_command(
+    let mut outcome = run_command(
         download.command,
         cancellation,
         limits.command_timeout,
         progress.id(),
-        use_yt_dlp.then(|| CommandProgress::Download(progress.clone())),
+        download
+            .reports_progress
+            .then(|| CommandProgress::Download(progress.clone())),
     )
-    .await
-    {
+    .await;
+    let public_fallback = match &outcome {
+        CommandOutcome::Finished {
+            success: false,
+            stdout,
+            stderr,
+        } => {
+            instagram::should_try_public(&url, stderr) || instagram::should_try_public(&url, stdout)
+        }
+        _ => false,
+    };
+    if public_fallback {
+        log::warn!(
+            "{info} | Instagram rejected authenticated access; trying the public post without saved cookies"
+        );
+        progress.downloading();
+        outcome =
+            download_public_instagram(&url, &mode, workspace, limits, cancellation, progress).await;
+        downloader_name = "yt-dlp (public Instagram)";
+        gallery_delivery = true;
+        // Keep metadata and any partial files from the first attempt out of delivery.
+        download_directory = workspace.join("instagram-public");
+    }
+    let (success, stdout, stderr) = match outcome {
         CommandOutcome::Finished {
             success,
             stdout,
@@ -260,26 +339,28 @@ async fn download_and_upload_in_workspace(
         if error_message.is_empty() {
             error_message = "Unknown error".to_string();
         }
-        progress.fail(format!("{downloader_name} download error: {error_message}"));
+        if public_fallback {
+            progress.fail(format!(
+                "{} Public download failed: {error_message}",
+                instagram::COOKIE_HINT
+            ));
+        } else {
+            progress.fail(format!("{downloader_name} download error: {error_message}"));
+        }
         return DownloadOutcome::Failed;
     }
 
     // Gather downloaded files.
-    let mut downloaded = collect_files(workspace).await;
-    if use_yt_dlp {
-        if downloaded.is_empty() {
-            progress.fail(format!(
-                "{downloader_name} finished, but its output file was not found"
-            ));
-            return DownloadOutcome::Failed;
-        }
-    } else {
-        if downloaded.is_empty() {
-            progress.fail(format!(
-                "{downloader_name} finished without producing a media file"
-            ));
-            return DownloadOutcome::Failed;
-        }
+    let mut downloaded = collect_files(&download_directory).await;
+    if downloaded.is_empty() {
+        progress.fail(format!(
+            "{downloader_name} finished without producing a media file"
+        ));
+        return DownloadOutcome::Failed;
+    }
+    if public_fallback {
+        downloaded.sort();
+    } else if gallery_delivery {
         // Sort to prefer videos, then images.
         downloaded.sort_by_key(|p| {
             let s = p.to_string_lossy().into_owned();
@@ -306,7 +387,7 @@ async fn download_and_upload_in_workspace(
         })
         .count();
     let replace_status_with_media = recognized_media_count == 1;
-    if !use_yt_dlp && gallery_media_count > 1 {
+    if gallery_delivery && gallery_media_count > 1 {
         let outcome = send_gallery_albums(
             &client,
             &message,
@@ -326,7 +407,7 @@ async fn download_and_upload_in_workspace(
         }
 
         if !tokio::fs::try_exists(item).await.unwrap_or(false) {
-            if !use_yt_dlp {
+            if gallery_delivery {
                 last_error = Some("a downloaded gallery item disappeared before upload".into());
                 continue;
             } else {
@@ -459,7 +540,7 @@ async fn download_and_upload_in_workspace(
                 format!("{downloader_name} produced no supported media to upload")
             }),
         );
-    } else if !use_yt_dlp && sent_count > 0 {
+    } else if gallery_delivery && sent_count > 0 {
         let total = downloaded.len();
         if sent_count == total {
             log::info!("{info} | Finished processing gallery. Sent all {sent_count} item(s).");

@@ -13,7 +13,7 @@ use crate::cancel::CancellationToken;
 use crate::jobs::JobProgress;
 use crate::media::inspect::extract_thumbnail;
 use crate::media::request::{DownloadLimits, DownloadOutcome};
-use crate::media::transcode::prepare_video;
+use crate::media::transcode::{prepare_photo, prepare_video};
 use crate::telegram::upload::with_retries;
 
 const UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -281,9 +281,17 @@ async fn prepare_album_media(
 ) -> anyhow::Result<InputMedia> {
     let (is_video, is_image, _, _) = media_kind(path);
     if is_image {
+        progress.inspecting();
+        let prepared = prepare_photo(
+            path,
+            cancellation,
+            limits.command_timeout,
+            &format!("Job #{} photo preparation", progress.id()),
+        )
+        .await?;
         let photo = upload_file_with_progress(
             client,
-            path,
+            &prepared,
             cancellation,
             progress,
             position,
@@ -409,9 +417,17 @@ pub(crate) async fn send_image(
     limits: DownloadLimits,
     delivery: DeliveryPlan,
 ) -> anyhow::Result<()> {
+    progress.inspecting();
+    let prepared = prepare_photo(
+        path,
+        cancellation,
+        limits.command_timeout,
+        &format!("Job #{} photo preparation", progress.id()),
+    )
+    .await?;
     let photo = upload_file_with_progress(
         client,
-        path,
+        &prepared,
         cancellation,
         progress,
         delivery.position,
