@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use grammers_client::Client;
-use grammers_client::update::Message as UpdateMessage;
+use grammers_client::message::Message;
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::cancel::CancellationToken;
+use crate::jobs::inbox::{Inbox, Receipt};
 use crate::jobs::progress::{JobPhase, JobProgress};
 use crate::media::pipeline;
 use crate::media::request::{DownloadOutcome, DownloadRequest, DownloadSettings};
@@ -18,10 +18,11 @@ const STATUS_HISTORY_LIMIT: usize = 4_096;
 struct DownloadJob {
     id: u64,
     owner_id: i64,
-    message: UpdateMessage,
+    message: Message,
     request: DownloadRequest,
     cancellation: CancellationToken,
     progress: JobProgress,
+    receipt: Receipt,
 }
 
 #[derive(Clone)]
@@ -51,7 +52,7 @@ struct SharedQueue {
     concurrency: usize,
     capacity: usize,
     settings: DownloadSettings,
-    next_id: AtomicU64,
+    inbox: Arc<Inbox>,
 }
 
 #[derive(Clone)]
@@ -67,10 +68,7 @@ pub struct DownloadQueue {
 pub enum QueueReply {
     Accepted(AcceptedReply),
     Silent,
-    Message {
-        message: Box<UpdateMessage>,
-        text: String,
-    },
+    Message { message: Box<Message>, text: String },
 }
 
 pub(crate) struct AcceptedReply {
@@ -99,6 +97,7 @@ impl DownloadQueue {
         concurrency: usize,
         capacity: usize,
         settings: DownloadSettings,
+        inbox: Arc<Inbox>,
     ) -> Self {
         assert!(concurrency > 0, "download concurrency must be positive");
         assert!(capacity > 0, "download queue capacity must be positive");
@@ -115,7 +114,7 @@ impl DownloadQueue {
             concurrency,
             capacity,
             settings,
-            next_id: AtomicU64::new(1),
+            inbox,
         });
         let runner_shared = Arc::clone(&shared);
         let runner = tokio::spawn(run_queue(runner_shared, client));
@@ -146,7 +145,8 @@ impl DownloadQueue {
 }
 
 impl DownloadQueueHandle {
-    pub fn status_report(&self, owner_id: i64) -> String {
+    pub async fn status_report(&self, owner_id: i64) -> String {
+        let unfinished = self.shared.inbox.unfinished(owner_id).await.ok();
         let state = lock(&self.shared.state);
         let active: Vec<_> = state
             .active
@@ -163,7 +163,7 @@ impl DownloadQueueHandle {
         let mut lines = vec![format!(
             "Your downloads: {} active, {} queued. Capacity: {}/{} active, {}/{} waiting.",
             active.len(),
-            queued.len(),
+            unfinished.map_or(queued.len(), |count| count.saturating_sub(active.len())),
             state.active.len(),
             self.shared.concurrency,
             state.pending.len(),
@@ -174,11 +174,18 @@ impl DownloadQueueHandle {
         lines.join("\n")
     }
 
+    pub fn has_capacity(&self) -> bool {
+        let state = lock(&self.shared.state);
+        state.accepting && state.pending.len() < self.shared.capacity
+    }
+
     pub fn try_enqueue(
         &self,
-        message: UpdateMessage,
+        message: Message,
         owner_id: i64,
         request: DownloadRequest,
+        receipt: Receipt,
+        status: Option<Message>,
     ) -> QueueReply {
         let mut state = lock(&self.shared.state);
         if !state.accepting {
@@ -199,9 +206,9 @@ impl DownloadQueueHandle {
             );
         }
 
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = receipt.id;
         let cancellation = CancellationToken::new();
-        let progress = JobProgress::new(id, message.clone());
+        let progress = JobProgress::new(id, message.clone(), receipt.clone(), status);
         state.pending.push_back(DownloadJob {
             id,
             owner_id,
@@ -209,6 +216,7 @@ impl DownloadQueueHandle {
             request: request.clone(),
             cancellation,
             progress: progress.clone(),
+            receipt,
         });
         drop(state);
         self.shared.changed.notify_one();
@@ -221,43 +229,49 @@ impl DownloadQueueHandle {
         })
     }
 
-    pub fn try_cancel(&self, message: UpdateMessage, owner_id: i64, id: u64) -> QueueReply {
-        let mut state = lock(&self.shared.state);
-
-        if let Some(position) = state
-            .pending
-            .iter()
-            .position(|job| job.id == id && job.owner_id == owner_id)
-        {
-            let job = state.pending.remove(position).expect("position must exist");
+    pub async fn try_cancel(&self, message: Message, owner_id: i64, id: u64) -> QueueReply {
+        let pending = {
+            let mut state = lock(&self.shared.state);
+            state
+                .pending
+                .iter()
+                .position(|job| job.id == id && job.owner_id == owner_id)
+                .and_then(|position| state.pending.remove(position))
+        };
+        if let Some(job) = pending {
             job.cancellation.cancel();
             job.progress.set_phase(JobPhase::Cancelled);
-            drop(state);
+            if let Err(error) = job.receipt.finish(DownloadOutcome::Cancelled).await {
+                log::error!("Could not persist cancellation of job #{id}: {error:#}");
+            }
             self.shared.changed.notify_one();
             return QueueReply::Silent;
         }
-
-        if let Some(job) = state
+        let active = lock(&self.shared.state)
             .active
             .get(&id)
             .filter(|job| job.owner_id == owner_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(job) = active {
             job.cancellation.cancel();
             job.progress.set_phase(JobPhase::Cancelling);
-            drop(state);
             return QueueReply::Silent;
         }
-
-        QueueReply::message(
-            message,
-            format!("No cancellable job #{id} was found for your account."),
-        )
+        match self.shared.inbox.cancel_pending(owner_id, id).await {
+            Ok(true) => QueueReply::message(message, format!("Job #{id} cancelled.")),
+            Ok(false) => QueueReply::message(
+                message,
+                format!("No cancellable job #{id} was found for your account."),
+            ),
+            Err(error) => {
+                QueueReply::message(message, format!("Could not cancel job #{id}: {error}"))
+            }
+        }
     }
 
-    pub fn try_cancel_replied(
+    pub async fn try_cancel_replied(
         &self,
-        message: UpdateMessage,
+        message: Message,
         owner_id: i64,
         status_message_id: i32,
     ) -> QueueReply {
@@ -265,8 +279,18 @@ impl DownloadQueueHandle {
             .status_jobs
             .get(&(owner_id, status_message_id))
             .map(|job| job.id);
+        let job_id = match job_id {
+            Some(id) => Some(id),
+            None => self
+                .shared
+                .inbox
+                .job_for_status(owner_id, status_message_id)
+                .await
+                .ok()
+                .flatten(),
+        };
         match job_id {
-            Some(job_id) => self.try_cancel(message, owner_id, job_id),
+            Some(id) => self.try_cancel(message, owner_id, id).await,
             None => QueueReply::message(
                 message,
                 "The replied message is not a known download status. Reply to a download status with /cancel.",
@@ -274,9 +298,9 @@ impl DownloadQueueHandle {
         }
     }
 
-    pub fn try_retry(
+    pub async fn try_retry(
         &self,
-        message: UpdateMessage,
+        message: Message,
         owner_id: i64,
         status_message_id: i32,
     ) -> QueueReply {
@@ -284,8 +308,35 @@ impl DownloadQueueHandle {
             .status_jobs
             .get(&(owner_id, status_message_id))
             .map(|job| job.request.clone());
+        let request = match request {
+            Some(request) => Some(request),
+            None => match self
+                .shared
+                .inbox
+                .request_for_status(owner_id, status_message_id)
+                .await
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    return QueueReply::message(
+                        message,
+                        format!("Could not load the download: {error}"),
+                    );
+                }
+            },
+        };
         match request {
-            Some(request) => self.try_enqueue(message, owner_id, request),
+            Some(request) => match self
+                .shared
+                .inbox
+                .admit(owner_id, message.id(), &[request])
+                .await
+            {
+                Ok(_) => QueueReply::Silent,
+                Err(error) => {
+                    QueueReply::message(message, format!("Could not queue the download: {error}"))
+                }
+            },
             None => QueueReply::message(
                 message,
                 "The replied message is not a known download status. Reply to a download status with /retry.",
@@ -299,7 +350,7 @@ impl QueueReply {
         matches!(self, Self::Accepted(_))
     }
 
-    fn message(message: UpdateMessage, text: impl Into<String>) -> Self {
+    fn message(message: Message, text: impl Into<String>) -> Self {
         Self::Message {
             message: Box::new(message),
             text: text.into(),
@@ -384,6 +435,7 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
                     shared: Arc::clone(&job_shared),
                 };
                 let result_progress = job.progress.clone();
+                let receipt = job.receipt.clone();
                 let cancellation = job.cancellation.clone();
                 let watchdog_cancellation = job.cancellation.clone();
                 let worker_progress = job.progress.clone();
@@ -425,6 +477,12 @@ async fn run_queue(shared: Arc<SharedQueue>, client: Client) {
                         DownloadOutcome::Failed
                     }
                 };
+                if let Err(error) = receipt.finish(outcome).await {
+                    log::error!(
+                        "Could not persist outcome of job #{}: {error:#}",
+                        receipt.id
+                    );
+                }
                 (result_progress, outcome)
             });
         }

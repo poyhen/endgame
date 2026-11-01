@@ -68,6 +68,10 @@ editable `config.json`, Telegram session and cookie files. The service reads
 `API_ID` and `API_HASH` from `/etc/endgame/environment`; keep this file owned
 by root with mode `0600` and do not put credentials in the Nix store or Git.
 
+The bot also keeps a private `downloads.sqlite` database in this directory. Keep
+it and its SQLite sidecar files with the Telegram session when moving or backing
+up an installation; it records pending work and which requests were finished.
+
 For a first installation, run these commands as root from the Git checkout:
 
 ```sh
@@ -124,12 +128,17 @@ just update
 
 - Send one or more URLs in a private message. Every URL becomes a separate,
   numbered job.
+- Links and `/audio`, `/video`, `/best`, and `/clip` requests sent while the bot
+  is offline are picked up automatically when it starts again. Pending and
+  interrupted jobs survive restarts, and completed requests are not replayed.
+  Identical links sent in separate messages still create separate jobs.
 - Multi-item gallery downloads are returned as Telegram albums in batches of
   at most ten items.
 - Use `/cancel <job-id>` to cancel one of your queued or active jobs, or reply
   to its status message with `/cancel` so no job ID is needed.
 - Reply to any download status with `/retry` to enqueue the same download
-  again. This works regardless of whether the original job failed.
+  again. This also works after restarting the bot and regardless of whether
+  the original job failed.
 - Use `/audio <url>` for an MP3 extraction.
 - Use `/video 720p <url>` to cap video quality, or `/best <url>` for the
   unrestricted default.
@@ -156,6 +165,14 @@ is owner-scoped: users cannot cancel or inspect another user's jobs.
 While primary media is uploading, the status includes the current item's
 percentage and estimated bytes remaining. Progress edits are throttled to avoid
 excessive Telegram requests; thumbnail uploads are not included.
+
+Requests are saved before Telegram's update checkpoint advances. A large offline
+backlog waits on disk and feeds into the normal bounded queue, keeping the same
+download concurrency. `/status` includes work waiting on disk, and `/cancel`
+can cancel it before it starts. Failed or cancelled jobs are not automatically
+retried; use `/retry` or send the link in a new message. During recovery, an
+existing status that already contains delivered media is recognized and kept
+instead of uploading that result again.
 
 Status edits and other Telegram delivery operations have bounded waits, while
 failed status edits are retried without blocking the media worker. `/status`
@@ -201,8 +218,9 @@ first, finish and close the diagnostic client, then restart the service last.
 for an authorization key. A diagnostic client can take over live updates even
 while the service stays connected; restarting the service restores its subscription.
 
-On Ctrl-C, new work is rejected and accepted jobs are drained before the
-Telegram connection closes.
+On Ctrl-C, new work stops and jobs already in memory are drained before the
+Telegram connection closes. Other pending jobs remain on disk for the next
+start. A forced shutdown also leaves interrupted work available for recovery.
 
 If Telegram returns a temporary server error while initializing a connection
 (for example, `rpc error -500: No workers running caused by invokeWithLayer`),
@@ -224,6 +242,9 @@ cargo clippy --all-targets -- -D warnings
 - `commands.rs`, `cookies.rs`, and `telegram/auth.rs` isolate Telegram-facing input concerns.
 - `jobs/queue.rs` schedules work, `jobs/progress.rs` coordinates progress state, and
   `jobs/status.rs` renders user-facing status text.
+- `jobs/inbox.rs` persists requests and completion records, and
+  `telegram/checkpoint.rs` keeps offline update batches recoverable until they
+  have been recorded.
 - `media/pipeline.rs` orchestrates jobs. Subprocesses, downloader policy, delivery,
   inspection, progress parsing, transcoding, request types, and temporary workspaces
   live in separate modules under `media/`.

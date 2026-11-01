@@ -1,3 +1,4 @@
+pub mod inbox;
 pub mod progress;
 pub mod queue;
 pub mod status;

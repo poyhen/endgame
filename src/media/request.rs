@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug)]
 pub struct DownloadLimits {
     pub max_upload_bytes: u64,
@@ -13,20 +15,20 @@ pub struct DownloadSettings {
     pub yt_dlp_domains: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadRequest {
     pub url: String,
     pub mode: DownloadMode,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownloadMode {
     Video { max_height: Option<u32> },
     Audio,
     Clip(ClipRange),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipRange {
     start: Duration,
     end: Duration,
@@ -69,6 +71,7 @@ impl DownloadRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DownloadOutcome {
     Completed,
     Failed,

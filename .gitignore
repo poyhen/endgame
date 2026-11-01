@@ -20,6 +20,8 @@ config.json
 userbot.session
 userbot.session-journal
 userbot.session-wal
+downloads.sqlite
+downloads.sqlite-*
 
 # Added by cargo
 

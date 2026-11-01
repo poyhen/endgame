@@ -370,6 +370,7 @@ dependencies = [
  "anyhow",
  "grammers-client",
  "grammers-session",
+ "libsql",
  "log",
  "mime",
  "mime_guess",

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use grammers_client::Client;
 use grammers_client::media::{Attribute, InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
-use grammers_client::update::Message as UpdateMessage;
+use grammers_client::message::Message;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::cancel::CancellationToken;
@@ -165,7 +165,7 @@ async fn upload_thumbnail(
 
 pub(crate) async fn send_gallery_albums(
     client: &Client,
-    message: &UpdateMessage,
+    message: &Message,
     downloaded: &[PathBuf],
     cancellation: &CancellationToken,
     progress: &JobProgress,
@@ -342,7 +342,7 @@ async fn prepare_album_media(
 
 pub(crate) async fn send_video(
     client: &Client,
-    message: &UpdateMessage,
+    message: &Message,
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
@@ -402,7 +402,7 @@ pub(crate) async fn send_video(
 
 pub(crate) async fn send_image(
     client: &Client,
-    message: &UpdateMessage,
+    message: &Message,
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
@@ -430,7 +430,7 @@ pub(crate) async fn send_image(
 
 pub(crate) async fn send_audio(
     client: &Client,
-    message: &UpdateMessage,
+    message: &Message,
     path: &Path,
     cancellation: &CancellationToken,
     progress: &JobProgress,
@@ -458,7 +458,7 @@ pub(crate) async fn send_audio(
 
 async fn deliver_media(
     client: &Client,
-    source: &UpdateMessage,
+    source: &Message,
     progress: &JobProgress,
     media: InputMessage,
     replace_status: bool,
@@ -500,7 +500,7 @@ async fn deliver_media(
 }
 
 async fn timed_fallback_send(
-    source: &UpdateMessage,
+    source: &Message,
     progress: &JobProgress,
     media: InputMessage,
 ) -> anyhow::Result<()> {

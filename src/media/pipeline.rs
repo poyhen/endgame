@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use grammers_client::Client;
-use grammers_client::update::Message as UpdateMessage;
+use grammers_client::message::Message;
 use tokio::process::Command;
 
 use crate::cancel::CancellationToken;
@@ -25,7 +25,7 @@ enum CommandProgress {
 const USER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 static USERNAME_CACHE: OnceLock<Mutex<HashMap<i64, Option<String>>>> = OnceLock::new();
 
-async fn user_info(client: &Client, message: &UpdateMessage) -> String {
+async fn user_info(client: &Client, message: &Message) -> String {
     let id = message.peer_id().bare_id();
     let embedded_username = message
         .sender()
@@ -43,7 +43,7 @@ async fn user_info(client: &Client, message: &UpdateMessage) -> String {
     format_user_info(username.as_deref(), id)
 }
 
-async fn resolve_username(client: &Client, message: &UpdateMessage, id: i64) -> Option<String> {
+async fn resolve_username(client: &Client, message: &Message, id: i64) -> Option<String> {
     if let Some(username) = username_cache().get(&id).cloned() {
         return username;
     }
@@ -156,7 +156,7 @@ fn is_image_ext(p: &str) -> bool {
 
 pub async fn download_and_upload(
     client: Client,
-    message: UpdateMessage,
+    message: Message,
     request: DownloadRequest,
     cancellation: &CancellationToken,
     progress: &JobProgress,
@@ -187,7 +187,7 @@ pub async fn download_and_upload(
 
 async fn download_and_upload_in_workspace(
     client: Client,
-    message: UpdateMessage,
+    message: Message,
     request: DownloadRequest,
     cancellation: &CancellationToken,
     progress: &JobProgress,

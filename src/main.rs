@@ -8,6 +8,7 @@ mod telegram;
 mod users;
 
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use grammers_client::sender::{ConnectionParams, UpdatesConfiguration};
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
+use grammers_session::Session;
 use grammers_session::types::PeerKind;
 use regex::Regex;
 use tokio::task::JoinSet;
@@ -22,6 +24,7 @@ use tokio::task::JoinSet;
 use commands::{MessageAction, classify_message};
 use config::Config;
 use jobs::DownloadQueue;
+use jobs::inbox::{Inbox, Recovery};
 use media::request::{DownloadLimits, DownloadSettings};
 use telegram::allowed_users::AllowedUsers;
 
@@ -72,6 +75,8 @@ async fn main() -> AnyResult<()> {
 
     log::info!("Userbot is running");
 
+    let inbox = Arc::new(Inbox::open(Path::new("downloads.sqlite")).await?);
+
     let download_settings = DownloadSettings {
         limits: DownloadLimits {
             max_upload_bytes: (cfg.max_upload_size_mb as u64).saturating_mul(1024 * 1024),
@@ -86,6 +91,7 @@ async fn main() -> AnyResult<()> {
         cfg.download_concurrency,
         cfg.download_queue_capacity,
         download_settings,
+        Arc::clone(&inbox),
     );
     let download_queue_handle = download_queue.handle();
     log::info!(
@@ -101,12 +107,26 @@ async fn main() -> AnyResult<()> {
     ));
     let url_pattern: Regex = cfg.url_pattern;
 
-    // Don't replay updates that arrived while we were offline. Those would be
-    // links sent during downtime, and reprocessing them all at once on startup
-    // causes massive download/upload spikes. Only handle links that arrive live.
+    let recovery_cancellation = cancel::CancellationToken::new();
+    let recovery = tokio::spawn(
+        Recovery {
+            inbox: Arc::clone(&inbox),
+            client: client.clone(),
+            session: Arc::clone(&session),
+            queue: download_queue_handle.clone(),
+            allowed_users: Arc::clone(&allowed_users),
+            super_users: Arc::clone(&super_users),
+            cancellation: recovery_cancellation.clone(),
+        }
+        .run(),
+    );
+
+    // Replay downtime updates into a durable inbox. The feeder respects the
+    // existing worker and in-memory queue limits, even for a large backlog.
     let mut updates = client
-        .stream_updates(updates, UpdatesConfiguration { catch_up: false })
+        .stream_updates(updates, UpdatesConfiguration { catch_up: true })
         .await?;
+    let mut checkpoint = telegram::checkpoint::Checkpoint::default();
 
     let mut handler_tasks = JoinSet::new();
 
@@ -120,16 +140,20 @@ async fn main() -> AnyResult<()> {
 
         let update = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            update = updates.next() => update,
+            update = updates.next_raw() => update,
         };
 
-        let update = match update {
+        let (raw, state, peers) = match update {
             Ok(u) => u,
             Err(e) => {
                 log::error!("Error receiving update: {e}");
                 continue;
             }
         };
+        if let Some(state) = checkpoint.observe(&state) {
+            session.set_update_state(state).await?;
+        }
+        let update = Update::from_raw(&client, raw, state, peers);
         let Update::NewMessage(message) = update else {
             continue;
         };
@@ -157,7 +181,18 @@ async fn main() -> AnyResult<()> {
 
         log::info!("Dispatching message from user {uid}");
         let text = message.text().to_string();
-        match classify_message(&text, &url_pattern) {
+        let action = classify_message(&text, &url_pattern);
+        if let MessageAction::Downloads(requests) = &action {
+            let added = inbox.admit(uid, message.id(), requests).await?;
+            log::info!("Persisted {added} new download request(s) from user {uid}");
+            continue;
+        }
+        if !matches!(action, MessageAction::Retry)
+            && !inbox.first_message(uid, message.id()).await?
+        {
+            continue;
+        }
+        match action {
             MessageAction::AddUser(user_id) => {
                 let supers = Arc::clone(&super_users);
                 let users = Arc::clone(&allowed_users);
@@ -193,33 +228,23 @@ async fn main() -> AnyResult<()> {
                 });
             }
             MessageAction::QueueStatus => {
-                let status = download_queue_handle.status_report(uid);
+                let status = download_queue_handle.status_report(uid).await;
                 spawn_handler(&mut handler_tasks, async move {
                     let _ = message.reply(status).await;
                 });
             }
-            MessageAction::Downloads(urls) => {
-                for url in urls {
-                    if handler_tasks.len() >= MAX_HANDLER_TASKS {
-                        log::warn!("Skipping a URL because no acknowledgement slot is available");
-                        break;
-                    }
-                    let reply = download_queue_handle.try_enqueue(message.clone(), uid, url);
-                    if reply.is_accepted() {
-                        spawn_definitive_handler(&mut handler_tasks, reply.send());
-                    } else {
-                        spawn_handler(&mut handler_tasks, reply.send());
-                    }
-                }
-            }
+            MessageAction::Downloads(_) => unreachable!("downloads were persisted above"),
             MessageAction::Cancel(Some(id)) => {
-                let reply = download_queue_handle.try_cancel(message, uid, id);
+                let reply = download_queue_handle
+                    .try_cancel(message.into_inner(), uid, id)
+                    .await;
                 spawn_handler(&mut handler_tasks, reply.send());
             }
             MessageAction::Cancel(None) => {
                 if let Some(status_message_id) = message.reply_to_message_id() {
-                    let reply =
-                        download_queue_handle.try_cancel_replied(message, uid, status_message_id);
+                    let reply = download_queue_handle
+                        .try_cancel_replied(message.into_inner(), uid, status_message_id)
+                        .await;
                     spawn_handler(&mut handler_tasks, reply.send());
                 } else {
                     spawn_handler(&mut handler_tasks, async move {
@@ -231,7 +256,9 @@ async fn main() -> AnyResult<()> {
             }
             MessageAction::Retry => {
                 if let Some(status_message_id) = message.reply_to_message_id() {
-                    let reply = download_queue_handle.try_retry(message, uid, status_message_id);
+                    let reply = download_queue_handle
+                        .try_retry(message.into_inner(), uid, status_message_id)
+                        .await;
                     if reply.is_accepted() {
                         spawn_definitive_handler(&mut handler_tasks, reply.send());
                     } else {
@@ -256,13 +283,18 @@ async fn main() -> AnyResult<()> {
 
     // Close admission first, finish bounded acknowledgement tasks, then drain
     // accepted downloads before disconnecting their Telegram client.
+    recovery_cancellation.cancel();
+    if let Err(error) = recovery.await {
+        log::error!("Recovery task failed: {error}");
+    }
     drop(download_queue_handle);
     while handler_tasks.join_next().await.is_some() {}
     log::info!("Draining download queue");
     download_queue.shutdown().await;
 
     log::info!("Saving session file");
-    let _ = updates.sync_update_state().await;
+    // The last processed group remains deliberately replayable. Do not save the
+    // receiver's newer state: it can include messages still buffered in memory.
 
     log::info!("Gracefully closing connection");
     handle.quit();

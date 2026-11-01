@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use grammers_client::Client;
-use grammers_client::message::{InputMessage, Message as SentMessage};
-use grammers_client::update::Message as UpdateMessage;
+use grammers_client::message::{InputMessage, Message};
 use tokio::sync::Notify;
 
+use crate::jobs::inbox::Receipt;
 use crate::jobs::status;
 
 const STATUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -18,8 +18,8 @@ pub struct JobProgress {
 
 struct JobProgressInner {
     id: u64,
-    source: UpdateMessage,
-    status: Mutex<Option<SentMessage>>,
+    source: Message,
+    status: Mutex<Option<Message>>,
     phase: Mutex<JobPhase>,
     last_render: Mutex<Option<String>>,
     flushing: AtomicBool,
@@ -31,6 +31,7 @@ struct JobProgressInner {
     failure: Mutex<Option<String>>,
     phase_since: Mutex<Instant>,
     edit_failures: AtomicU8,
+    receipt: Receipt,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,23 +58,26 @@ pub enum JobPhase {
 }
 
 impl JobProgress {
-    pub(crate) fn new(id: u64, source: UpdateMessage) -> Self {
+    pub(crate) fn new(id: u64, source: Message, receipt: Receipt, status: Option<Message>) -> Self {
+        let attached = status.is_some();
+        let last_render = status.as_ref().map(|message| message.text().to_owned());
         Self {
             inner: Arc::new(JobProgressInner {
                 id,
                 source,
-                status: Mutex::new(None),
+                status: Mutex::new(status),
                 phase: Mutex::new(JobPhase::Queued),
-                last_render: Mutex::new(None),
+                last_render: Mutex::new(last_render),
                 flushing: AtomicBool::new(false),
                 edit_lock: tokio::sync::Mutex::new(()),
                 status_ready: Notify::new(),
-                attachment_done: AtomicBool::new(false),
+                attachment_done: AtomicBool::new(attached),
                 final_media: AtomicBool::new(false),
                 delete_when_attached: AtomicBool::new(false),
                 failure: Mutex::new(None),
                 phase_since: Mutex::new(Instant::now()),
                 edit_failures: AtomicU8::new(0),
+                receipt,
             }),
         }
     }
@@ -218,6 +222,11 @@ impl JobProgress {
     }
 
     pub(crate) async fn attach(&self) -> Option<i32> {
+        let existing = lock(&self.inner.status).as_ref().map(Message::id);
+        if let Some(id) = existing {
+            self.schedule_flush();
+            return Some(id);
+        }
         let initial = self.render();
         match tokio::time::timeout(
             STATUS_OPERATION_TIMEOUT,
@@ -233,6 +242,12 @@ impl JobProgress {
             }
             Ok(Ok(status)) => {
                 let status_message_id = status.id();
+                if let Err(error) = self.inner.receipt.status(status_message_id).await {
+                    log::error!(
+                        "Could not persist status for job #{}: {error:#}",
+                        self.inner.id
+                    );
+                }
                 *lock(&self.inner.status) = Some(status.clone());
                 *lock(&self.inner.last_render) = Some(initial);
                 self.inner.attachment_done.store(true, Ordering::Release);
@@ -279,7 +294,7 @@ impl JobProgress {
         }
     }
 
-    async fn wait_for_status(&self) -> Option<SentMessage> {
+    async fn wait_for_status(&self) -> Option<Message> {
         let wait = async {
             loop {
                 if let Some(status) = lock(&self.inner.status).clone() {
