@@ -153,9 +153,11 @@ just update
   and survive restarts. Superusers can only be changed by editing the config
   file. `/users` lists everyone allowed to download, including Telegram
   usernames and full names when available.
-- Superusers can use `/insta <cookie-content>` to replace Instagram cookies.
-  The cookie message is deleted and the local file is written with owner-only
-  permissions on Unix systems.
+- Superusers can use `/insta <cookie-content>` or `/tiktok <cookie-content>` to
+  replace Instagram or TikTok cookies in Netscape cookie-file format. The bot
+  deletes the cookie message and writes `instacookies.txt` or `tiktokcookies.txt`
+  with owner-only permissions on Unix systems. Each site uses its own cookie
+  file when present; otherwise the bot falls back to `cookies.txt`.
 
 If Instagram rejects a post with an authentication error, the bot retries it
 without saved cookies using Instagram's public page. This fallback supports
@@ -164,6 +166,18 @@ Private or restricted posts still need working account cookies. If Instagram
 requires an account checkpoint, open Instagram in your browser, complete the
 verification, and export fresh cookies with `/insta`. A generic `400 Bad Request`
 from the media-info API can indicate this checkpoint even before the cookies expire.
+
+For Instagram `/p/` posts, when gallery-dl can access a photo and its associated
+music, the bot sends the original photo and a separate video showing that photo
+for the full available soundtrack. For a carousel, it sends the original album
+in Instagram's order and a separate music video showing each photo for an equal
+share of the soundtrack. In mixed carousels, the album includes the original
+videos and photos, while the music video uses the photos. The soundtrack can be
+longer than the excerpt selected in Instagram. If music is detected but cannot
+be downloaded or converted, the original media is still sent and the job
+reports a warning. The public Instagram fallback can return photos and videos
+but does not retrieve photo-post music. Forcing Instagram through
+`yt_dlp_domains` also bypasses this gallery-dl music handling.
 
 Each accepted job maintains one status message as it moves through queued,
 downloading, inspection, transcoding, thumbnail preparation, uploading,

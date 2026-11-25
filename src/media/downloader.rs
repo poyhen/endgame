@@ -4,6 +4,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use url::Url;
 
+use crate::cookies::CookieSite;
+use crate::media::instagram;
 use crate::media::request::{DownloadLimits, DownloadMode};
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0";
@@ -37,15 +39,16 @@ pub fn build(
         command.arg(url);
         command
     } else {
-        let mut command = Command::new(program);
-        command
-            .arg("--cookies")
-            .arg(cookie_file)
-            .arg("--user-agent")
-            .arg(USER_AGENT)
-            .arg("-D")
-            .arg(workspace)
-            .arg(url);
+        let mut command = gallery_dl_command(cookie_file, workspace);
+        if instagram::is_post(url) && matches!(mode, DownloadMode::Video { .. }) {
+            command
+                .arg("--write-metadata")
+                .arg("-o")
+                .arg("extractor.instagram.audio=false")
+                .arg("-o")
+                .arg("extractor.instagram.previews=false");
+        }
+        command.arg(url);
         command
     };
     DownloadCommand {
@@ -53,6 +56,18 @@ pub fn build(
         program,
         reports_progress: use_yt_dlp,
     }
+}
+
+pub(crate) fn gallery_dl_command(cookie_file: &Path, workspace: &Path) -> Command {
+    let mut command = Command::new("gallery-dl");
+    command
+        .arg("--cookies")
+        .arg(cookie_file)
+        .arg("--user-agent")
+        .arg(USER_AGENT)
+        .arg("-D")
+        .arg(workspace);
+    command
 }
 
 pub(crate) fn yt_dlp_command() -> Command {
@@ -123,7 +138,7 @@ pub(crate) fn configure_yt_dlp(
 }
 
 fn unrestricted_video_format(url: &str) -> &'static str {
-    if url.contains("tiktok.com") {
+    if CookieSite::from_url(url) == Some(CookieSite::TikTok) {
         "bestvideo[ext=mp4][vcodec=h264]+bestaudio[ext=m4a]/best[ext=mp4][vcodec=h264]/best"
     } else {
         DEFAULT_FORMAT
@@ -151,7 +166,9 @@ fn format_clip_timestamp(timestamp: Duration) -> String {
 }
 
 fn should_use_yt_dlp(url: &str, yt_dlp_domains: &[String]) -> bool {
-    if matches_yt_dlp_domain(url, yt_dlp_domains) {
+    if matches_yt_dlp_domain(url, yt_dlp_domains)
+        || CookieSite::from_url(url) == Some(CookieSite::TikTok)
+    {
         return true;
     }
     [
@@ -162,7 +179,6 @@ fn should_use_yt_dlp(url: &str, yt_dlp_domains: &[String]) -> bool {
         "instagram.com/reels/",
         "instagram.com/tv/",
         "x.com/i/broadcasts/",
-        "tiktok.com/",
     ]
     .iter()
     .any(|domain| url.contains(domain))
@@ -268,6 +284,40 @@ mod tests {
             );
             assert!(download.reports_progress);
         }
+    }
+
+    #[test]
+    fn instagram_posts_save_metadata_without_downloading_music_as_a_video() {
+        let download = build(
+            "https://www.instagram.com/p/example/?query=value",
+            &DownloadMode::Video { max_height: None },
+            Path::new("instacookies.txt"),
+            Path::new("/tmp/endgame-test"),
+            limits(),
+            &[],
+        );
+        let args = arguments(&download);
+        assert_eq!(download.program, "gallery-dl");
+        assert!(args.iter().any(|arg| arg == "--write-metadata"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "extractor.instagram.audio=false")
+        );
+
+        let audio = build(
+            "https://www.instagram.com/p/example/",
+            &DownloadMode::Audio,
+            Path::new("instacookies.txt"),
+            Path::new("/tmp/endgame-test"),
+            limits(),
+            &[],
+        );
+        assert_eq!(audio.program, "yt-dlp");
+        assert!(
+            !arguments(&audio)
+                .iter()
+                .any(|arg| arg == "--write-metadata")
+        );
     }
 
     #[test]
@@ -411,6 +461,8 @@ mod tests {
             ("https://media.example.com/video", "gallery-dl"),
             ("https://youtube.com/watch?v=example", "yt-dlp"),
             ("https://tiktok.com/@example/video/123", "yt-dlp"),
+            ("https://VM.TIKTOK.COM/shortcode", "yt-dlp"),
+            ("https://other.example/?url=tiktok.com/", "gallery-dl"),
             ("https://instagram.com/p/example/", "gallery-dl"),
         ] {
             let download = build(

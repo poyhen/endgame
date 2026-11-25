@@ -87,6 +87,53 @@ pub async fn probe_video(
     Ok(metadata)
 }
 
+/// An Instagram soundtrack can be an audio-only MP4, so inspect its streams
+/// instead of treating its extension as the media type.
+pub(crate) async fn probe_audio_duration(
+    audio_file: &Path,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    operation: &str,
+) -> anyhow::Result<f64> {
+    let mut command = Command::new("ffprobe");
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("a:0")
+        .arg("-show_entries")
+        .arg("stream=duration:format=duration")
+        .arg("-of")
+        .arg("json")
+        .arg(audio_file);
+    let (success, stdout, stderr) = run(command, cancellation, timeout, operation).await?;
+    if !success {
+        anyhow::bail!("ffprobe could not read Instagram audio: {stderr}");
+    }
+    let metadata: serde_json::Value = serde_json::from_str(&stdout)?;
+    let stream = metadata
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| streams.first())
+        .ok_or_else(|| anyhow::anyhow!("Instagram music has no audio stream"))?;
+    let parse_duration = |value: &serde_json::Value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            .filter(|duration: &f64| duration.is_finite() && *duration > 0.0)
+    };
+    stream
+        .get("duration")
+        .and_then(parse_duration)
+        .or_else(|| {
+            metadata
+                .get("format")?
+                .get("duration")
+                .and_then(parse_duration)
+        })
+        .ok_or_else(|| anyhow::anyhow!("Instagram music has no usable duration"))
+}
+
 async fn run(
     command_to_run: Command,
     cancellation: &CancellationToken,

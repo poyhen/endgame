@@ -1,6 +1,7 @@
 use regex::Regex;
 use std::time::Duration;
 
+use crate::cookies::CookieSite;
 use crate::media::request::{ClipRange, DownloadRequest};
 
 const CLIP_USAGE: &str =
@@ -10,7 +11,7 @@ pub enum MessageAction {
     AddUser(Option<i64>),
     RemoveUser(Option<i64>),
     ListUsers,
-    InstagramCookies,
+    Cookies(CookieSite),
     HealthCheck,
     QueueStatus,
     Cancel(Option<u64>),
@@ -35,11 +36,12 @@ pub fn classify_message(text: &str, url_pattern: &Regex) -> MessageAction {
                 .filter(|user_id| *user_id > 0),
         ),
         Some(name) if name == "users" => MessageAction::ListUsers,
-        Some(name) if name == "insta" => MessageAction::InstagramCookies,
+        Some(name) if name == "insta" => MessageAction::Cookies(CookieSite::Instagram),
+        Some(name) if name == "tiktok" => MessageAction::Cookies(CookieSite::TikTok),
         Some(name) if name == "h" || name == "ping" => MessageAction::HealthCheck,
         Some(name) if name == "status" || name == "queue" => MessageAction::QueueStatus,
         Some(name) if name == "help" => MessageAction::Reply(
-            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /status, or /ping. You can also reply to a download status with /cancel or /retry. Superusers can use /add <user-id>, /remove <user-id>, and /users.",
+            "Send one or more links, or use /audio <url>, /video [height] <url>, /best <url>, /clip <start> <end> <url>, /cancel <job-id>, /status, or /ping. You can also reply to a download status with /cancel or /retry. Superusers can use /add <user-id>, /remove <user-id>, /users, /insta <cookie-content>, and /tiktok <cookie-content>.",
         ),
         Some(name) if name == "cancel" => MessageAction::Cancel(
             text.split_whitespace()
@@ -228,6 +230,18 @@ mod tests {
         assert!(matches!(
             classify_message("/users@endgame", &pattern()),
             MessageAction::ListUsers
+        ));
+    }
+
+    #[test]
+    fn parses_site_cookie_commands_even_when_content_contains_a_url() {
+        assert!(matches!(
+            classify_message("/insta # https://example.com/cookies", &pattern()),
+            MessageAction::Cookies(CookieSite::Instagram)
+        ));
+        assert!(matches!(
+            classify_message("/tiktok@endgame # https://example.com/cookies", &pattern()),
+            MessageAction::Cookies(CookieSite::TikTok)
         ));
     }
 

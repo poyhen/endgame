@@ -216,10 +216,10 @@ async fn main() -> AnyResult<()> {
                     users::handle_list(message, uid, supers, users, client, session).await;
                 });
             }
-            MessageAction::InstagramCookies => {
+            MessageAction::Cookies(site) => {
                 let supers = Arc::clone(&super_users);
                 spawn_handler(&mut handler_tasks, async move {
-                    cookies::handle_update(&message, &text, uid, &supers).await;
+                    cookies::handle_update(&message, &text, uid, &supers, site).await;
                 });
             }
             MessageAction::HealthCheck => {

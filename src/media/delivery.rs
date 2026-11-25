@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use crate::cancel::CancellationToken;
 use crate::jobs::JobProgress;
 use crate::media::inspect::extract_thumbnail;
-use crate::media::request::{DownloadLimits, DownloadOutcome};
+use crate::media::request::DownloadLimits;
 use crate::media::transcode::{prepare_photo, prepare_video};
 use crate::telegram::upload::with_retries;
 
@@ -24,6 +24,12 @@ const THUMBNAIL_UPLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) struct DeliveryPlan {
     pub position: (usize, usize),
     pub replace_status: bool,
+}
+
+pub(crate) enum GalleryOutcome {
+    Sent { warning: Option<String> },
+    Failed(String),
+    Cancelled,
 }
 
 struct ProgressReader<R> {
@@ -171,7 +177,7 @@ pub(crate) async fn send_gallery_albums(
     progress: &JobProgress,
     info: &str,
     limits: DownloadLimits,
-) -> DownloadOutcome {
+) -> GalleryOutcome {
     let media_paths: Vec<&Path> = downloaded
         .iter()
         .filter_map(|item| {
@@ -197,7 +203,7 @@ pub(crate) async fn send_gallery_albums(
 
         for (offset, path) in media_paths[cursor..cursor + batch_size].iter().enumerate() {
             if cancellation.is_cancelled() {
-                return DownloadOutcome::Cancelled;
+                return GalleryOutcome::Cancelled;
             }
 
             let prepared = prepare_album_media(
@@ -210,7 +216,7 @@ pub(crate) async fn send_gallery_albums(
             )
             .await;
             if cancellation.is_cancelled() {
-                return DownloadOutcome::Cancelled;
+                return GalleryOutcome::Cancelled;
             }
             match prepared {
                 Ok(media) => {
@@ -239,7 +245,7 @@ pub(crate) async fn send_gallery_albums(
         progress.finalizing();
         let send_result = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return DownloadOutcome::Cancelled,
+            _ = cancellation.cancelled() => return GalleryOutcome::Cancelled,
             _ = tokio::time::sleep(TELEGRAM_OPERATION_TIMEOUT) => {
                 Err(anyhow::anyhow!(
                     "Telegram album send timed out after {} seconds",
@@ -259,15 +265,13 @@ pub(crate) async fn send_gallery_albums(
 
     if sent > 0 {
         log::info!("{info} | Finished processing gallery. Sent {sent}/{total} item(s) in albums.");
-        if let Some(error) = last_error {
-            progress.complete_with_warning(error);
-        } else {
-            progress.delete_status().await;
+        GalleryOutcome::Sent {
+            warning: last_error,
         }
-        DownloadOutcome::Completed
     } else {
-        progress.fail(last_error.unwrap_or_else(|| "gallery contained no uploadable media".into()));
-        DownloadOutcome::Failed
+        GalleryOutcome::Failed(
+            last_error.unwrap_or_else(|| "gallery contained no uploadable media".into()),
+        )
     }
 }
 
